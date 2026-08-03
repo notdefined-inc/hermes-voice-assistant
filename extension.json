@@ -1,7 +1,7 @@
 {
   "id": "voice-assistant",
   "name": "Voice Assistant",
-  "version": "3.4.0",
+  "version": "3.5.0",
   "description": "Always-on voice mode with wake word, continuous VAD, TTS playback, and barge-in",
   "assets": {
     "scripts": ["assets/voice-assistant.js"],

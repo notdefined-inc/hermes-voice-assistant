@@ -127,7 +127,7 @@ Reload the WebUI page. The 🎤 orb appears bottom-right. No build step, no depe
 - **Auto-Listen** — re-arm mic after the reply finishes
 - **Sensitivity** — slider (left = less sensitive, right = more)
 - **TTS Voice** — pick an allowed server voice
-- **TTS Engine** — `Edge` (free, no key, default) · `OpenAI` · `ElevenLabs` · `Browser` (client-side Web Speech API; no server key, quality depends on your OS/browser voices)
+- **TTS Engine** — `Edge` (free, no key, default) · `OpenAI` · `ElevenLabs` · `Browser` (client-side Web Speech API; no server key, quality depends on your OS/browser voices). **ElevenLabs voice preset defaults to Adam** (free creator voice) — paid *library* voices return `402 paid_plan_required` on free accounts, so only use your own voice IDs
 - **Start Pre-roll** — ms of audio kept *before* speech is confirmed (fixes cut-off first words; maps to Silero `preSpeechPadFrames`)
 - **Min Speech** — how long a sound must persist before it counts as speech (kills false "silence → transcribe" misfires; maps to `minSpeechFrames`)
 - **End Silence** — trailing silence that ends the utterance (maps to `redemptionFrames`)

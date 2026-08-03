@@ -32,10 +32,17 @@
     autoListenDelay: 500,
 
     ttsEnabled: true,
-    ttsVoice: 'en-GB-SoniaNeural',
     ttsEngine: 'edge',       // edge (default, no key) | openai | elevenlabs | browser
     ttsRate: '',
     ttsChunkSize: 500,
+    // Per-engine voice profiles. ttsVoice is the Edge name (allowlisted by the
+    // server); elevenlabsVoice is the ElevenLabs voice_id; openaiVoice is the
+    // OpenAI voice name. The settings panel shows engine-appropriate voices.
+    // NOTE: ElevenLabs default = Adam (pNInz6obpgDQGcFmaJgB), a FREE creator
+    // voice. Library voices (e.g. m3yAHyFEFKtbCIM5n7GF) require a paid plan.
+    ttsVoice: 'en-GB-SoniaNeural',
+    elevenlabsVoice: 'pNInz6obpgDQGcFmaJgB',
+    openaiVoice: 'alloy',
 
     // Speech detection (Silero VAD) — configurable timing. All in milliseconds.
     // preRollMs = audio buffered before speech is confirmed (fixes cut-off starts)
@@ -88,6 +95,8 @@
         ttsEnabled: CFG.ttsEnabled,
         ttsVoice: CFG.ttsVoice,
         ttsEngine: CFG.ttsEngine,
+        elevenlabsVoice: CFG.elevenlabsVoice,
+        openaiVoice: CFG.openaiVoice,
         ttsRate: CFG.ttsRate,
         preRollMs: CFG.preRollMs,
         minSpeechMs: CFG.minSpeechMs,
@@ -110,6 +119,15 @@
         CFG.truncateChars = s.speechBudgetChars;
       }
       // } end migration
+
+      // v3.5: ElevenLabs default voice was a PAID library voice that returns
+      // 402 on free accounts. Replace any broken (paid-only) library voice_id
+      // with the free Adam creator voice so ElevenLabs works out of the box.
+      var BROKEN_EL_VOICES = { 'm3yAHyFEFKtbCIM5n7GF': true };  // known paid library voice
+      if (CFG.elevenlabsVoice && BROKEN_EL_VOICES[CFG.elevenlabsVoice]) {
+        CFG.elevenlabsVoice = 'pNInz6obpgDQGcFmaJgB';  // Adam (free)
+        saveSettings();
+      }
     } catch (_) {}
   }
 
@@ -167,13 +185,6 @@
       '<div class="va-setting-row"><div><label>Sensitivity</label><div class="va-hint">← Less sensitive · More →</div></div>',
       '<div class="va-slider-row"><input type="range" min="1" max="10" value="' + sensVal + '" id="va-sens-slider">',
       '<span class="va-slider-val" id="va-sens-val">' + sensVal + '</span></div></div>',
-      '<div class="va-setting-row"><div><label>TTS Voice</label></div>',
-      '<select id="va-voice-select"><option value="">Default</option>',
-        '<option value="en-US-JennyNeural"' + (CFG.ttsVoice === 'en-US-JennyNeural' ? ' selected' : '') + '>Jenny (US)</option>',
-        '<option value="en-US-GuyNeural"' + (CFG.ttsVoice === 'en-US-GuyNeural' ? ' selected' : '') + '>Guy (US)</option>',
-        '<option value="en-GB-SoniaNeural"' + (CFG.ttsVoice === 'en-GB-SoniaNeural' ? ' selected' : '') + '>Sonia (UK)</option>',
-        '<option value="en-GB-RyanNeural"' + (CFG.ttsVoice === 'en-GB-RyanNeural' ? ' selected' : '') + '>Ryan (UK)</option>',
-      '</select></div>',
       '<div class="va-setting-row"><div><label>TTS Engine</label><div class="va-hint">Edge = free, no key. Others need a server API key</div></div>',
       '<select id="va-engine-select">',
         '<option value="edge"' + (CFG.ttsEngine === 'edge' ? ' selected' : '') + '>Edge (free)</option>',
@@ -181,6 +192,8 @@
         '<option value="elevenlabs"' + (CFG.ttsEngine === 'elevenlabs' ? ' selected' : '') + '>ElevenLabs</option>',
         '<option value="browser"' + (CFG.ttsEngine === 'browser' ? ' selected' : '') + '>Browser (client)</option>',
       '</select></div>',
+      '<div class="va-setting-row"><div><label>Voice</label><div class="va-hint" id="va-voice-hint">Choose a voice for the selected engine</div></div>',
+      '<div id="va-voice-control">' + voiceControlHTML() + '</div></div>',
       '<div class="va-setting-row"><div><label>Start Pre-roll</label><div class="va-hint">Audio kept before speech is confirmed (fixes cut-off starts)</div></div>',
       '<div class="va-slider-row"><input type="range" min="0" max="900" step="50" value="' + CFG.preRollMs + '" id="va-preroll-slider">',
       '<span class="va-slider-val" id="va-preroll-val">' + CFG.preRollMs + 'ms</span></div></div>',
@@ -196,8 +209,98 @@
       '<div class="va-toggle' + (CFG.truncateEnabled ? ' va-on' : '') + '" id="va-truncate-toggle"><div class="va-toggle-knob"></div></div></div>',
       '<div class="va-setting-row" id="va-truncate-row" style="display:' + (CFG.truncateEnabled ? 'flex' : 'none') + '"><div><label>Max chars</label></div>',
       '<input type="number" id="va-truncate-input" min="60" max="4000" step="10" value="' + CFG.truncateChars + '" style="width:90px;"></div>',
-      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v3.3 · Silero VAD · SSE Hook · Pipelined TTS · Double-click for settings</div>',
+      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v3.5 · Silero VAD · SSE Hook · Pipelined TTS · Double-click for settings</div>',
     ].join('');
+  }
+
+  // Engine-aware voice control. Edge = allowlisted neural voices; OpenAI =
+  // fixed voice names; ElevenLabs = voice_id (with known FREE voices as
+  // presets — paid library voices return 402 on free accounts); Browser = OS
+  // voices (lang tag or name).
+  function voiceControlHTML() {
+    if (CFG.ttsEngine === 'elevenlabs') {
+      var FREE_EL = [
+        ['pNInz6obpgDQGcFmaJgB', 'Adam'],
+        ['EXAVITQu4vr4xnSDxMaL', 'Bella'],
+        ['VR6AewLTigWG4xSOukaG', 'Arnold'],
+        ['ErXwobaYiN019PkySvjV', 'Antoni'],
+        ['onwK4e9ZLuTAKqWW03F9', 'Domi'],
+      ];
+      var opts = '<select id="va-voice-select">';
+      var current = CFG.elevenlabsVoice || '';
+      for (var i = 0; i < FREE_EL.length; i++) {
+        opts += '<option value="' + FREE_EL[i][0] + '"' + (current === FREE_EL[i][0] ? ' selected' : '') + '>' + FREE_EL[i][1] + '</option>';
+      }
+      opts += '<option value="__custom__"' + (FREE_EL.every(function (f) { return f[0] !== current; }) ? ' selected' : '') + '>Custom…</option>';
+      opts += '</select>';
+      return opts;
+    }
+    if (CFG.ttsEngine === 'openai') {
+      var oaiVoices = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer', 'coral', 'verse', 'ash', 'ballad', 'sage'];
+      var opts2 = '<option value="">Default</option>';
+      for (var j = 0; j < oaiVoices.length; j++) {
+        opts2 += '<option value="' + oaiVoices[j] + '"' + (CFG.openaiVoice === oaiVoices[j] ? ' selected' : '') + '>' + oaiVoices[j] + '</option>';
+      }
+      return '<select id="va-voice-select">' + opts2 + '</select>';
+    }
+    if (CFG.ttsEngine === 'browser') {
+      return '<input type="text" id="va-voice-input" value="' + (CFG.ttsVoice || '') + '" placeholder="e.g. en-GB, or voice name" style="width:180px;" spellcheck="false">';
+    }
+    // edge (default)
+    return '<select id="va-voice-select"><option value="">Default</option>' +
+      '<option value="en-US-JennyNeural"' + (CFG.ttsVoice === 'en-US-JennyNeural' ? ' selected' : '') + '>Jenny (US)</option>' +
+      '<option value="en-US-GuyNeural"' + (CFG.ttsVoice === 'en-US-GuyNeural' ? ' selected' : '') + '>Guy (US)</option>' +
+      '<option value="en-GB-SoniaNeural"' + (CFG.ttsVoice === 'en-GB-SoniaNeural' ? ' selected' : '') + '>Sonia (UK)</option>' +
+      '<option value="en-GB-RyanNeural"' + (CFG.ttsVoice === 'en-GB-RyanNeural' ? ' selected' : '') + '>Ryan (UK)</option>' +
+      '</select>';
+  }
+
+  // Re-render the engine-aware voice control + update its hint.
+  function refreshVoiceControl() {
+    var ctrl = document.getElementById('va-voice-control');
+    if (ctrl) ctrl.innerHTML = voiceControlHTML();
+    var hint = document.getElementById('va-voice-hint');
+    if (hint) {
+      if (CFG.ttsEngine === 'elevenlabs') hint.textContent = 'Paste an ElevenLabs voice_id';
+      else if (CFG.ttsEngine === 'openai') hint.textContent = 'Choose an OpenAI voice name';
+      else if (CFG.ttsEngine === 'browser') hint.textContent = 'Lang tag (e.g. en-GB) or OS voice name';
+      else hint.textContent = 'Choose an Edge (Microsoft) neural voice';
+    }
+    wireVoiceControl();
+  }
+
+  // Attach handlers to whichever voice control is currently rendered.
+  function wireVoiceControl() {
+    var sel = document.getElementById('va-voice-select');
+    if (sel) {
+      sel.addEventListener('change', function () {
+        if (CFG.ttsEngine === 'edge') { CFG.ttsVoice = sel.value; saveSettings(); }
+        else if (CFG.ttsEngine === 'openai') { CFG.openaiVoice = sel.value; saveSettings(); }
+        else if (CFG.ttsEngine === 'elevenlabs') {
+          if (sel.value === '__custom__') {
+            // Replace the select with a text input for pasting a voice_id.
+            var ctrl = document.getElementById('va-voice-control');
+            if (ctrl) {
+              ctrl.innerHTML = '<input type="text" id="va-voice-input" value="' + CFG.elevenlabsVoice + '" placeholder="Paste ElevenLabs voice_id" style="width:180px;" spellcheck="false">';
+              wireVoiceControl();
+            }
+          } else {
+            CFG.elevenlabsVoice = sel.value;
+            saveSettings();
+          }
+        }
+      });
+      return;
+    }
+    var input = document.getElementById('va-voice-input');
+    if (input) {
+      input.addEventListener('change', function () {
+        var v = input.value.trim();
+        if (CFG.ttsEngine === 'elevenlabs') CFG.elevenlabsVoice = v;
+        else if (CFG.ttsEngine === 'browser') CFG.ttsVoice = v;
+        saveSettings();
+      });
+    }
   }
 
   function wirePanel() {
@@ -253,17 +356,21 @@
       saveSettings();
     });
 
-    var voice = document.getElementById('va-voice-select');
-    if (voice) voice.addEventListener('change', function () { CFG.ttsVoice = voice.value; saveSettings(); });
-
-    // TTS Engine selector.
+    // TTS Engine selector — switching engine re-renders the voice control.
     var engine = document.getElementById('va-engine-select');
-    if (engine) engine.addEventListener('change', function () { CFG.ttsEngine = engine.value; saveSettings(); });
+    if (engine) engine.addEventListener('change', function () {
+      CFG.ttsEngine = engine.value;
+      refreshVoiceControl();
+      saveSettings();
+    });
 
     // VAD timing sliders — dynamic-range maps ms → frames at init/update time.
     bindRange('va-preroll-slider', 'va-preroll-val', 'preRollMs', 0, 900, 'ms');
     bindRange('va-minspeech-slider', 'va-minspeech-val', 'minSpeechMs', 100, 1200, 'ms');
     bindRange('va-endsil-slider', 'va-endsil-val', 'endSilenceMs', 200, 2000, 'ms');
+
+    // Attach handlers to the engine-specific voice control rendered at build.
+    wireVoiceControl();
   }
 
   // Generic range-slider binding: updates CFG[key], per-second label, saves,
@@ -738,7 +845,14 @@
   // (Browser engine is handled separately in speakText via SpeechSynthesis.)
   function fetchAudioBlob(text) {
     var body = { text: text, engine: CFG.ttsEngine };
-    if (CFG.ttsVoice) body.voice = CFG.ttsVoice;
+    // Send the engine-appropriate voice:
+    //  - edge      → Edge neural voice name (server allowlist)
+    //  - openai    → OpenAI voice name
+    //  - elevenlabs → ElevenLabs voice_id
+    var voice = CFG.ttsVoice;
+    if (CFG.ttsEngine === 'openai') voice = CFG.openaiVoice;
+    else if (CFG.ttsEngine === 'elevenlabs') voice = CFG.elevenlabsVoice;
+    if (voice) body.voice = voice;
     if (CFG.ttsRate) body.rate = CFG.ttsRate;
     return fetch('/api/tts', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
