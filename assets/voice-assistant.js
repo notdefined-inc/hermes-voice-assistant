@@ -33,9 +33,17 @@
 
     ttsEnabled: true,
     ttsVoice: 'en-GB-SoniaNeural',
-    ttsEngine: 'edge',
+    ttsEngine: 'edge',       // edge (default, no key) | openai | elevenlabs | browser
     ttsRate: '',
     ttsChunkSize: 500,
+
+    // Speech detection (Silero VAD) — configurable timing. All in milliseconds.
+    // preRollMs = audio buffered before speech is confirmed (fixes cut-off starts)
+    // minSpeechMs = how long speech must persist before being accepted (misfire guard)
+    // endSilenceMs = trailing silence that ends the utterance
+    preRollMs: 300,
+    minSpeechMs: 400,
+    endSilenceMs: 650,
 
     // Crisp Replies: append a directive to the outgoing message so the AGENT
     // itself answers short and direct. The full answer reflects this — it's
@@ -81,6 +89,9 @@
         ttsVoice: CFG.ttsVoice,
         ttsEngine: CFG.ttsEngine,
         ttsRate: CFG.ttsRate,
+        preRollMs: CFG.preRollMs,
+        minSpeechMs: CFG.minSpeechMs,
+        endSilenceMs: CFG.endSilenceMs,
         crispPrompt: CFG.crispPrompt,
         truncateEnabled: CFG.truncateEnabled,
         truncateChars: CFG.truncateChars,
@@ -163,6 +174,22 @@
         '<option value="en-GB-SoniaNeural"' + (CFG.ttsVoice === 'en-GB-SoniaNeural' ? ' selected' : '') + '>Sonia (UK)</option>',
         '<option value="en-GB-RyanNeural"' + (CFG.ttsVoice === 'en-GB-RyanNeural' ? ' selected' : '') + '>Ryan (UK)</option>',
       '</select></div>',
+      '<div class="va-setting-row"><div><label>TTS Engine</label><div class="va-hint">Edge = free, no key. Others need a server API key</div></div>',
+      '<select id="va-engine-select">',
+        '<option value="edge"' + (CFG.ttsEngine === 'edge' ? ' selected' : '') + '>Edge (free)</option>',
+        '<option value="openai"' + (CFG.ttsEngine === 'openai' ? ' selected' : '') + '>OpenAI</option>',
+        '<option value="elevenlabs"' + (CFG.ttsEngine === 'elevenlabs' ? ' selected' : '') + '>ElevenLabs</option>',
+        '<option value="browser"' + (CFG.ttsEngine === 'browser' ? ' selected' : '') + '>Browser (client)</option>',
+      '</select></div>',
+      '<div class="va-setting-row"><div><label>Start Pre-roll</label><div class="va-hint">Audio kept before speech is confirmed (fixes cut-off starts)</div></div>',
+      '<div class="va-slider-row"><input type="range" min="0" max="900" step="50" value="' + CFG.preRollMs + '" id="va-preroll-slider">',
+      '<span class="va-slider-val" id="va-preroll-val">' + CFG.preRollMs + 'ms</span></div></div>',
+      '<div class="va-setting-row"><div><label>Min Speech</label><div class="va-hint">Longest sound before it counts as speech (kills misfires)</div></div>',
+      '<div class="va-slider-row"><input type="range" min="100" max="1200" step="50" value="' + CFG.minSpeechMs + '" id="va-minspeech-slider">',
+      '<span class="va-slider-val" id="va-minspeech-val">' + CFG.minSpeechMs + 'ms</span></div></div>',
+      '<div class="va-setting-row"><div><label>End Silence</label><div class="va-hint">Trailing silence that ends the utterance</div></div>',
+      '<div class="va-slider-row"><input type="range" min="200" max="2000" step="50" value="' + CFG.endSilenceMs + '" id="va-endsil-slider">',
+      '<span class="va-slider-val" id="va-endsil-val">' + CFG.endSilenceMs + 'ms</span></div></div>',
       '<div class="va-setting-row"><div><label>Crisp Replies</label><div class="va-hint">Tell the agent to answer short & direct</div></div>',
       '<div class="va-toggle' + (CFG.crispPrompt ? ' va-on' : '') + '" id="va-crisp-toggle"><div class="va-toggle-knob"></div></div></div>',
       '<div class="va-setting-row"><div><label>Truncate Speech</label><div class="va-hint">Cap read-aloud length only</div></div>',
@@ -228,6 +255,48 @@
 
     var voice = document.getElementById('va-voice-select');
     if (voice) voice.addEventListener('change', function () { CFG.ttsVoice = voice.value; saveSettings(); });
+
+    // TTS Engine selector.
+    var engine = document.getElementById('va-engine-select');
+    if (engine) engine.addEventListener('change', function () { CFG.ttsEngine = engine.value; saveSettings(); });
+
+    // VAD timing sliders — dynamic-range maps ms → frames at init/update time.
+    bindRange('va-preroll-slider', 'va-preroll-val', 'preRollMs', 0, 900, 'ms');
+    bindRange('va-minspeech-slider', 'va-minspeech-val', 'minSpeechMs', 100, 1200, 'ms');
+    bindRange('va-endsil-slider', 'va-endsil-val', 'endSilenceMs', 200, 2000, 'ms');
+  }
+
+  // Generic range-slider binding: updates CFG[key], per-second label, saves,
+  // and live-applies the VAD frame mapping if the VAD is already running.
+  function bindRange(sliderId, labelId, key, min, max, suffix) {
+    var el = document.getElementById(sliderId);
+    if (!el) return;
+    el.addEventListener('input', function () {
+      var v = parseInt(el.value, 10);
+      if (isNaN(v)) v = min;
+      v = Math.max(min, Math.min(max, v));
+      CFG[key] = v;
+      var label = document.getElementById(labelId);
+      if (label) label.textContent = v + suffix;
+      applyVadConfigToActive();
+      saveSettings();
+    });
+  }
+
+  // Push the current CFG VAD values into a live Silero VAD instance, mapping
+  // milliseconds to frames (legacy model: 1536 samples/frame @ 16kHz = 96ms).
+  function applyVadConfigToActive() {
+    if (!STATE.vad) return;
+    var framesPerMs = 1 / 96;
+    try {
+      STATE.vad.setOptions({
+        positiveSpeechThreshold: CFG.positiveSpeechThreshold,
+        negativeSpeechThreshold: CFG.negativeSpeechThreshold,
+        minSpeechFrames: Math.max(2, Math.round(CFG.minSpeechMs * framesPerMs)),
+        preSpeechPadFrames: Math.max(0, Math.round(CFG.preRollMs * framesPerMs)),
+        redemptionFrames: Math.max(2, Math.round(CFG.endSilenceMs * framesPerMs)),
+      });
+    } catch (e) { console.warn('[VA] applyVadConfigToActive:', e); }
   }
 
   function openPanel() {
@@ -403,20 +472,26 @@
       var mod = await import(VAD_CDN);
       var MicVAD = mod.MicVAD;
 
+      // ms → frames: legacy Silero model uses 1536 samples/frame @ 16kHz = 96ms.
+      var framesPerMs = 1 / 96;
+
       STATE.vad = await MicVAD.new({
         stream: STATE.audioStream,   // use OUR stream — library never calls getUserMedia
         positiveSpeechThreshold: CFG.positiveSpeechThreshold,
         negativeSpeechThreshold: CFG.negativeSpeechThreshold,
-        minSpeechFrames: CFG.minSpeechFrames,
-        preSpeechPadFrames: CFG.preSpeechPadFrames,
-        redemptionFrames: CFG.redemptionFrames,
+        minSpeechFrames: Math.max(2, Math.round(CFG.minSpeechMs * framesPerMs)),
+        preSpeechPadFrames: Math.max(0, Math.round(CFG.preRollMs * framesPerMs)),
+        redemptionFrames: Math.max(2, Math.round(CFG.endSilenceMs * framesPerMs)),
         onSpeechStart: function () {
           console.log('[VA] Speech start');
-          beginRecording();
+          setPhase('listening'); // stay armed; buffer is owned by Silero
         },
-        onSpeechEnd: function () {
-          console.log('[VA] Speech end');
-          finishRecording();
+        onSpeechEnd: function (audio) {
+          console.log('[VA] Speech end (%d samples)', audio ? audio.length : 0);
+          // Silero hands us the full utterance INCLUDING pre-roll padding —
+          // encode to WAV ourselves; never use MediaRecorder (it starts too
+          // late and loses the first ~200-400ms of speech).
+          finishWithAudio(audio);
         },
         onVADMisfire: function () {
           console.log('[VA] VAD misfire — too short');
@@ -434,58 +509,86 @@
   }
 
   // ═══════════════════════════════════════════════════════════════
-  //  Recording (engine-agnostic, uses stream from Silero VAD)
+  //  Recording — Silero hands us the audio buffer directly (incl. pre-roll).
+  //  We encode to WAV client-side and POST to /api/transcribe.
   // ═══════════════════════════════════════════════════════════════
 
-  function getMicStream() {
-    // We procured the stream ourselves in loadVAD() and own it directly.
-    return STATE.audioStream;
+  // Encode a Float32Array (16kHz mono) into a WAV Blob.
+  function encodeWav(samples) {
+    var numChannels = 1;
+    var sampleRate = 16000;
+    var bitDepth = 16;
+    var bytesPerSample = bitDepth / 8;
+    var blockAlign = numChannels * bytesPerSample;
+    var dataSize = samples.length * blockAlign;
+    var buffer = new ArrayBuffer(44 + dataSize);
+    var view = new DataView(buffer);
+
+    // RIFF chunk
+    writeAscii(view, 0, 'RIFF');
+    view.setUint32(4, 36 + dataSize, true);
+    writeAscii(view, 8, 'WAVE');
+
+    // fmt chunk
+    writeAscii(view, 12, 'fmt ');
+    view.setUint32(16, 16, true);                 // fmt chunk size
+    view.setUint16(20, 1, true);                  // PCM format
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * blockAlign, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, bitDepth, true);
+
+    // data chunk
+    writeAscii(view, 36, 'data');
+    view.setUint32(40, dataSize, true);
+
+    // 16-bit PCM samples
+    var offset = 44;
+    for (var i = 0; i < samples.length; i++) {
+      var s = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      offset += 2;
+    }
+    return new Blob([buffer], { type: 'audio/wav' });
   }
 
-  function beginRecording() {
-    if (STATE.phase !== 'listening') return;
-    var stream = getMicStream();
-    if (!stream) return;
-
-    STATE.chunks = [];
-    var mimeType = 'audio/webm;codecs=opus';
-    if (typeof MediaRecorder !== 'undefined' && !MediaRecorder.isTypeSupported(mimeType)) { mimeType = 'audio/webm'; if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = ''; }
-
-    try {
-      STATE.mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType: mimeType } : undefined);
-    } catch (e) { console.error('[VA] MediaRecorder init failed:', e); return; }
-
-    STATE.mediaRecorder.ondataavailable = function (e) { if (e.data && e.data.size > 0) STATE.chunks.push(e.data); };
-    STATE.mediaRecorder.start(200);
+  function writeAscii(view, offset, str) {
+    for (var i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
   }
 
-  function finishRecording() {
-    if (!STATE.mediaRecorder || STATE.mediaRecorder.state !== 'recording') {
-      // VAD ended but recorder wasn't running — reset
+  // Called by Silero's onSpeechEnd with the captured utterance.
+  function finishWithAudio(audio) {
+    if (!audio || !audio.length) { resetSileroMic(); return; }
+
+    // Guard: require the utterance to actually contain speech energy, else
+    // the "silence/misfire → instant transcribe" loop would spam the STT.
+    var peak = 0;
+    for (var i = 0; i < audio.length; i += 40) {
+      var a = Math.abs(audio[i]);
+      if (a > peak) peak = a;
+    }
+    if (peak < 0.002) {  // effectively silent clip
+      console.log('[VA] utterance too quiet, ignoring');
       resetSileroMic();
       return;
     }
 
-    STATE.mediaRecorder.onstop = function () {
-      var blob = new Blob(STATE.chunks, { type: STATE.mediaRecorder.mimeType || 'audio/webm' });
-      STATE.mediaRecorder = null;
-      if (blob.size < 1500) { resetSileroMic(); return; }
+    var blob = encodeWav(audio);
+    if (blob.size < 1500) { resetSileroMic(); return; }
 
-      setPhase('transcribing');
-      transcribeAudio(blob).then(function (text) {
-        if (text && text.trim().length > 0) {
-          sendToAgent(text.trim());
-        } else {
-          resetSileroMic();
-        }
-      }).catch(function (err) {
-        console.error('[VA] Transcribe failed:', err);
-        showToast('Voice: Transcription failed');
+    setPhase('transcribing');
+    transcribeAudio(blob).then(function (text) {
+      if (text && text.trim().length > 0) {
+        sendToAgent(text.trim());
+      } else {
         resetSileroMic();
-      });
-    };
-
-    try { STATE.mediaRecorder.stop(); } catch (_) {}
+      }
+    }).catch(function (err) {
+      console.error('[VA] Transcribe failed:', err);
+      showToast('Voice: Transcription failed');
+      resetSileroMic();
+    });
   }
 
   function resetSileroMic() {
@@ -504,7 +607,7 @@
 
   async function transcribeAudio(blob) {
     var formData = new FormData();
-    var ext = blob.type.includes('webm') ? '.webm' : '.ogg';
+    var ext = blob.type.includes('wav') ? '.wav' : (blob.type.includes('webm') ? '.webm' : '.ogg');
     formData.append('file', blob, 'voice' + ext);
     var resp = await fetch('/api/transcribe', { method: 'POST', body: formData });
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -632,6 +735,7 @@
   }
 
   // Prefetch a chunk's audio while previously-fetched chunks are playing.
+  // (Browser engine is handled separately in speakText via SpeechSynthesis.)
   function fetchAudioBlob(text) {
     var body = { text: text, engine: CFG.ttsEngine };
     if (CFG.ttsVoice) body.voice = CFG.ttsVoice;
@@ -647,6 +751,8 @@
   }
 
   function playAudioURL(url) {
+    // Browser engine already spoke via SpeechSynthesis — nothing to play here.
+    if (url === null) return Promise.resolve();
     return new Promise(function (resolve, reject) {
       var audio = new Audio(url);
       audio.setAttribute('playsinline', '');
@@ -670,6 +776,15 @@
     // Pause VAD during playback — no speech detection while speaking
     if (STATE.vad) { try { STATE.vad.pause(); } catch (_) {} }
 
+    // Browser engine: SpeechSynthesis queues utterances natively and calls us
+    // back when each ends, so we speak sequentially and wait for the last one.
+    if (CFG.ttsEngine === 'browser') {
+      await speakBrowserChunks(chunks);
+      STATE.ttsActive = false;
+      await new Promise(function (r) { setTimeout(r, 400); });
+      return;
+    }
+
     // Pipeline: pre-fetch the next blob while the current one plays, so the
     // Edge TTS latency (~1-3s) is hidden behind playback — no punctuation gaps.
     var nextFetch = fetchAudioBlob(chunks[0]);
@@ -687,9 +802,53 @@
     await new Promise(function (r) { setTimeout(r, 400); });
   }
 
+  // Sequential browser-engine speech via SpeechSynthesis. A token promise
+  // resolves when the last queued utterance ends, giving gapless queueing
+  // that still respects stopTTS() (which calls speechSynthesis.cancel()).
+  function speakBrowserChunks(chunks) {
+    return new Promise(function (resolve) {
+      if (!chunks.length) { resolve(); return; }
+      if (!('speechSynthesis' in window)) { resolve(); return; }
+
+      var finished = false;
+      function done() { if (!finished) { finished = true; STATE.browserSpeechDone = true; resolve(); } }
+
+      for (var i = 0; i < chunks.length; i++) {
+        if (!STATE.ttsActive) { done(); return; }
+        var utter = new SpeechSynthesisUtterance(chunks[i]);
+        var voices = window.speechSynthesis.getVoices();
+        if (CFG.ttsVoice && voices.length) {
+          var wantLang = CFG.ttsVoice.split('-').slice(0, 2).join('-');
+          var match = null;
+          for (var v = 0; v < voices.length; v++) {
+            if (voices[v].name === CFG.ttsVoice || voices[v].voiceURI.indexOf(CFG.ttsVoice) >= 0 || voices[v].lang === wantLang) { match = voices[v]; break; }
+          }
+          if (match) utter.voice = match;
+          else if (voices.some(function (vv) { return vv.lang === wantLang; })) {
+            utter.lang = wantLang;  // browser picks best available in this locale
+          }
+        }
+        if (CFG.ttsRate) { var r = parseFloat(CFG.ttsRate); if (!isNaN(r) && r > -50) utter.rate = 1 + r / 100; }
+        utter.onend = (i === chunks.length - 1) ? done : null;
+        utter.onerror = (i === chunks.length - 1) ? done : null;
+        window.speechSynthesis.speak(utter);
+      }
+
+      // Safety net: if the last utterance never fires onend (some browsers are
+      // flaky with speechSynthesis), resolve after an estimated timeout based
+      // on total text length (~15 chars/sec worst case).
+      var estMs = Math.max(2000, Math.round(chunks.join(' ').length / 15 * 1000));
+      setTimeout(done, estMs + 3000);
+    });
+  }
+
   function stopTTS() {
     STATE.ttsActive = false;
     if (STATE.ttsAudio) { try { STATE.ttsAudio.pause(); } catch (_) {} STATE.ttsAudio = null; }
+    // Browser engine: cancel any queued SpeechSynthesis.
+    if (CFG.ttsEngine === 'browser' && 'speechSynthesis' in window) {
+      try { window.speechSynthesis.cancel(); } catch (_) {}
+    }
     // Note: VAD restart is handled by nextListen() / stopEverything() — this
     // only cuts audio playback so the two call sites stay consistent.
   }
@@ -738,23 +897,12 @@
     }
   }
 
-  // Full stop: back to idle, kill VAD + recorder + TTS.
+  // Full stop: back to idle, kill VAD + TTS.
   function stopEverything() {
     console.log('[VA] Stopping — back to idle');
     if (STATE.vad) { try { STATE.vad.pause(); } catch (_) {} }
-
-    if (STATE.mediaRecorder && STATE.mediaRecorder.state === 'recording') {
-      STATE.chunks = [];
-      STATE.mediaRecorder.onstop = null;
-      try { STATE.mediaRecorder.stop(); } catch (_) {}
-      STATE.mediaRecorder = null;
-    }
-
     stopTTS();
-    // Drop the pending audio context so nothing keeps the mic warm
-    setTimeout(function () {
-      if (STATE.phase === 'idle') setPhase('idle');
-    }, 50);
+    STATE.chunks = [];
     setPhase('idle');
   }
 

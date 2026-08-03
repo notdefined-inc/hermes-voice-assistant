@@ -1,7 +1,7 @@
 ---
 name: hermes-voice-assistant
 description: "Operating and troubleshooting the Voice Assistant WebUI extension for Hermes: Silero VAD, SSE-based response detection, Edge TTS, crisp/truncate speech modes, and the server-side prerequisites (CSP wasm-unsafe-eval, TTS voice allowlist)."
-version: 3.3.0
+version: 3.4.0
 author: Twilla
 license: MIT
 platforms: [linux, macos, windows]

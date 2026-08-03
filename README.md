@@ -127,8 +127,14 @@ Reload the WebUI page. The 🎤 orb appears bottom-right. No build step, no depe
 - **Auto-Listen** — re-arm mic after the reply finishes
 - **Sensitivity** — slider (left = less sensitive, right = more)
 - **TTS Voice** — pick an allowed server voice
+- **TTS Engine** — `Edge` (free, no key, default) · `OpenAI` · `ElevenLabs` · `Browser` (client-side Web Speech API; no server key, quality depends on your OS/browser voices)
+- **Start Pre-roll** — ms of audio kept *before* speech is confirmed (fixes cut-off first words; maps to Silero `preSpeechPadFrames`)
+- **Min Speech** — how long a sound must persist before it counts as speech (kills false "silence → transcribe" misfires; maps to `minSpeechFrames`)
+- **End Silence** — trailing silence that ends the utterance (maps to `redemptionFrames`)
 - **Crisp Replies** — append a prompt directive so the agent answers short & direct
 - **Truncate Speech** + **Max chars** — cap read-aloud length at a sentence boundary ("The full answer is on screen.")
+
+All VAD timings are persisted in `localStorage` and applied live to a running VAD.
 
 ## Files
 
@@ -156,7 +162,9 @@ voice-assistant/
 |---------|-------------|
 | `Speech detection init failed` / WASM toast | CSP missing `'wasm-unsafe-eval'` — patch `helpers.py`, restart, verify header with curl |
 | `Cannot read properties of undefined (reading 'getUserMedia')` | `navigator.mediaDevices` absent (non-secure context). Connect via localhost/HTTPS |
-| Speaking "not working", everything else fine | `/api/tts` voice not in the server allowlist → `400 invalid voice`. Add UK voices, restart |
+| Speaking "not working", everything else fine | `/api/tts` voice not in the server allowlist → `400 invalid voice`. Add UK voices, restart. Or switch **TTS Engine** to `Browser` (client-side, no allowlist) |
+| Misses the first words of my question | Raise **Start Pre-roll** (Silero buffers audio before speech is confirmed; the capture path uses that buffer, not a late-starting MediaRecorder) |
+| Transcribes too easily on clicks/silence | Raise **Min Speech** (needs longer sustained sound to count as speech) and/or **Sensitivity** toward "Less" |
 | Pauses at every comma | Fixed by pipelined prefetch (v3.2+). Ensure you're running the latest `voice-assistant.js` |
 | Orb stuck while "Thinking…" | SSE `done` event missed; watchdog auto-recovers to idle after 3 min |
 | Mic picks up slight sounds | Raise Sensitivity (moves to "less sensitive"), or set higher `positiveSpeechThreshold` |
