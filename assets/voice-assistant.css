@@ -1,0 +1,289 @@
+/* ═══ Voice Assistant Extension CSS ═══ */
+
+/* ── Floating orb button ─────────────────────────────────────── */
+#va-orb {
+  position: fixed;
+  bottom: 80px;
+  right: 24px;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  z-index: 99999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24px;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+}
+
+:root.dark #va-orb {
+  background: rgba(99, 102, 241, 0.2);
+  border: 1px solid rgba(99, 102, 241, 0.4);
+  color: #a5b4fc;
+}
+:root:not(.dark) #va-orb {
+  background: rgba(99, 102, 241, 0.15);
+  border: 1px solid rgba(99, 102, 241, 0.3);
+  color: #4f46e5;
+}
+
+#va-orb:hover {
+  transform: scale(1.08);
+  box-shadow: 0 6px 32px rgba(99, 102, 241, 0.4);
+}
+
+/* Active states */
+#va-orb.va-listening {
+  background: rgba(239, 68, 68, 0.25) !important;
+  border-color: rgba(239, 68, 68, 0.6) !important;
+  color: #f87171 !important;
+  animation: va-pulse-listening 1.5s ease-in-out infinite;
+}
+
+#va-orb.va-speaking {
+  background: rgba(34, 197, 94, 0.25) !important;
+  border-color: rgba(34, 197, 94, 0.6) !important;
+  color: #4ade80 !important;
+  animation: va-pulse-speaking 0.8s ease-in-out infinite;
+}
+
+#va-orb.va-processing {
+  background: rgba(245, 158, 11, 0.25) !important;
+  border-color: rgba(245, 158, 11, 0.6) !important;
+  color: #fbbf24 !important;
+}
+
+#va-orb.va-armed {
+  background: rgba(99, 102, 241, 0.35) !important;
+  border-color: rgba(129, 140, 248, 0.7) !important;
+  color: #c7d2fe !important;
+  animation: va-pulse-armed 3s ease-in-out infinite;
+}
+
+@keyframes va-pulse-listening {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+  50% { box-shadow: 0 0 0 12px rgba(239, 68, 68, 0); }
+}
+@keyframes va-pulse-speaking {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.4); }
+  50% { box-shadow: 0 0 0 8px rgba(34, 197, 94, 0); }
+}
+@keyframes va-pulse-armed {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.3); }
+  50% { box-shadow: 0 0 0 6px rgba(99, 102, 241, 0); }
+}
+
+/* ── Audio level indicator ───────────────────────────────────── */
+#va-level-bar {
+  position: fixed;
+  bottom: 144px;
+  right: 24px;
+  width: 56px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(128, 128, 128, 0.2);
+  overflow: hidden;
+  z-index: 99998;
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+#va-level-bar.va-visible { opacity: 1; }
+#va-level-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #f87171, #fbbf24, #4ade80);
+  transition: width 0.08s linear;
+}
+
+/* ── Status label ────────────────────────────────────────────── */
+#va-status-label {
+  position: fixed;
+  bottom: 152px;
+  right: 24px;
+  z-index: 99998;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 4px 10px;
+  border-radius: 12px;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  opacity: 0;
+  transition: opacity 0.3s;
+  pointer-events: none;
+}
+#va-status-label.va-visible { opacity: 1; }
+:root.dark #va-status-label {
+  background: rgba(0, 0, 0, 0.5);
+  color: rgba(255, 255, 255, 0.7);
+}
+:root:not(.dark) #va-status-label {
+  background: rgba(255, 255, 255, 0.7);
+  color: rgba(0, 0, 0, 0.5);
+}
+
+/* ── Settings panel ──────────────────────────────────────────── */
+#va-panel {
+  position: fixed;
+  bottom: 80px;
+  right: 92px;
+  width: 300px;
+  max-height: 440px;
+  overflow-y: auto;
+  border-radius: 16px;
+  z-index: 100000;
+  padding: 20px;
+  display: none;
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.3);
+}
+#va-panel.va-open { display: block; animation: va-panel-in 0.2s ease-out; }
+@keyframes va-panel-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+:root.dark #va-panel {
+  background: rgba(15, 15, 25, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+:root:not(.dark) #va-panel {
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+#va-panel h3 {
+  margin: 0 0 12px 0;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.va-setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 0;
+  font-size: 13px;
+}
+.va-setting-row + .va-setting-row {
+  border-top: 1px solid rgba(128, 128, 128, 0.12);
+}
+
+.va-setting-row label {
+  font-weight: 500;
+  cursor: pointer;
+}
+.va-setting-row .va-hint {
+  font-size: 11px;
+  opacity: 0.5;
+  margin-top: 2px;
+}
+
+/* Toggle switch */
+.va-toggle {
+  position: relative;
+  width: 38px;
+  height: 22px;
+  background: rgba(128, 128, 128, 0.3);
+  border-radius: 11px;
+  cursor: pointer;
+  transition: background 0.2s;
+  flex-shrink: 0;
+}
+.va-toggle.va-on {
+  background: var(--accent, #6366f1);
+}
+.va-toggle-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: white;
+  transition: transform 0.2s;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+}
+.va-toggle.va-on .va-toggle-knob { transform: translateX(16px); }
+
+/* Slider */
+.va-slider-row { display: flex; align-items: center; gap: 8px; }
+.va-slider-row input[type="range"] {
+  flex: 1;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  border-radius: 2px;
+  background: rgba(128, 128, 128, 0.2);
+  outline: none;
+}
+.va-slider-row input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent, #6366f1);
+  cursor: pointer;
+}
+.va-slider-val {
+  font-size: 11px;
+  min-width: 30px;
+  text-align: right;
+  opacity: 0.6;
+}
+
+/* Select */
+.va-setting-row select {
+  background: transparent;
+  border: 1px solid rgba(128, 128, 128, 0.3);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: inherit;
+  cursor: pointer;
+}
+
+/* ── Wake word ripple effect ─────────────────────────────────── */
+#va-ripple-container {
+  position: fixed;
+  bottom: 80px;
+  right: 24px;
+  width: 56px;
+  height: 56px;
+  pointer-events: none;
+  z-index: 99997;
+}
+.va-ripple {
+  position: absolute;
+  top: 0; left: 0;
+  width: 56px; height: 56px;
+  border-radius: 50%;
+  border: 2px solid rgba(99, 102, 241, 0.5);
+  animation: va-ripple-expand 1s ease-out forwards;
+}
+@keyframes va-ripple-expand {
+  to { transform: scale(2.5); opacity: 0; }
+}
+
+/* ── Barge-in visual flash ───────────────────────────────────── */
+.va-barge-flash {
+  position: fixed;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  background: radial-gradient(circle at center, rgba(239, 68, 68, 0.1) 0%, transparent 60%);
+  pointer-events: none;
+  z-index: 99996;
+  animation: va-flash-fade 0.4s ease-out forwards;
+}
+@keyframes va-flash-fade {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
