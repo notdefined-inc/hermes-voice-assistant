@@ -75,6 +75,11 @@
     ttsActive: false,
     responseDone: false,
     responseText: '',
+    // True once the voice loop has launched a request (start or steer) and is
+    // awaiting the agent's reply. The SSE 'done' handler speaks whenever this
+    // is set, regardless of the current phase — so steered follow-ups queued
+    // into the same turn still get read aloud (fixes "only first reply spoken").
+    expectingReply: false,
     evalWasmTested: false,
     panelOpen: false,
     sseHooked: false,
@@ -489,13 +494,13 @@
           STATE.responseDone = true;
           STATE.responseText = text;
 
-          if (STATE.phase === 'processing') {
+          if (STATE.expectingReply) {
             onAgentResponseComplete(text);
           }
         } catch (err) {
           console.warn('[VA] SSE done parse error, triggering anyway:', err);
           STATE.responseDone = true;
-          if (STATE.phase === 'processing') onAgentResponseComplete('');
+          if (STATE.expectingReply) onAgentResponseComplete('');
         }
       });
 
@@ -722,13 +727,15 @@
     return data.transcript || '';
   }
 
+  // Send user's voice text to the agent. If the agent is already mid-turn
+  // (busy), steer (append) the message into the active run — Codex-style —
+  // instead of queueing it as a separate turn. Falls back to a normal send
+  // when the agent is idle or steer is unavailable.
   function sendToAgent(text) {
     setPhase('processing');
     STATE.responseDone = false;
     STATE.responseText = '';
-
-    var textarea = document.getElementById('msg');
-    if (!textarea) { console.error('[VA] No #msg textarea'); resetSileroMic(); return; }
+    STATE.expectingReply = true;
 
     // Crisp Replies: append a directive so the AGENT answers short & direct.
     var outText = text;
@@ -736,7 +743,27 @@
       outText = text + '\n\n(Instruction: ' + CFG.crispDirective + ')';
     }
 
-    textarea.value = outText;
+    var isBusy = typeof S !== 'undefined' && S.busy && (S.activeStreamId || (S.session && S.session.active_stream_id));
+    var canSteer = isBusy && typeof _trySteer === 'function';
+
+    if (canSteer) {
+      console.log('[VA] Agent busy — steering message into active turn');
+      _trySteer(outText, /*explicitSteer=*/false).catch(function (err) {
+        console.warn('[VA] steer failed, falling back to send():', err);
+        sendViaComposer(outText);
+      });
+      return;
+    }
+
+    sendViaComposer(outText);
+  }
+
+  // Inject into the composer and trigger the WebUI's global send().
+  function sendViaComposer(text) {
+    var textarea = document.getElementById('msg');
+    if (!textarea) { console.error('[VA] No #msg textarea'); clearExpectingReply(); resetSileroMic(); return; }
+
+    textarea.value = text;
     textarea.dispatchEvent(new Event('input', { bubbles: true }));
 
     setTimeout(function () {
@@ -748,12 +775,18 @@
 
       // Watchdog: if SSE done doesn't fire in 3 min, recover
       setTimeout(function () {
-        if (STATE.phase === 'processing' && !STATE.responseDone) {
+        if (STATE.expectingReply && !STATE.responseDone) {
           console.warn('[VA] Watchdog: SSE done not received in 3 min, recovering');
+          clearExpectingReply();
           setPhase('idle');
         }
       }, 180000);
     }, 100);
+  }
+
+  // Stop awaiting a reply (after TTS finishes or on abort).
+  function clearExpectingReply() {
+    STATE.expectingReply = false;
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -762,6 +795,7 @@
 
   function onAgentResponseComplete(text) {
     if (!CFG.ttsEnabled || !text.trim()) {
+      clearExpectingReply();
       if (CFG.autoListen) setTimeout(nextListen, CFG.autoListenDelay);
       else setPhase('idle');
       return;
@@ -769,10 +803,12 @@
 
     setPhase('speaking');
     speakText(text).then(function () {
+      clearExpectingReply();
       setPhase('idle');
       if (CFG.autoListen) setTimeout(nextListen, CFG.autoListenDelay);
     }).catch(function (err) {
       console.error('[VA] TTS failed:', err);
+      clearExpectingReply();
       setPhase('idle');
     });
   }
@@ -1017,6 +1053,7 @@
     if (STATE.vad) { try { STATE.vad.pause(); } catch (_) {} }
     stopTTS();
     STATE.chunks = [];
+    clearExpectingReply();
     setPhase('idle');
   }
 

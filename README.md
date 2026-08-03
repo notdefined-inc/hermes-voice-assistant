@@ -9,6 +9,7 @@ Silero neural VAD (speech detection) · local faster-whisper transcription · Ed
 ## Features
 
 - **Always-on voice loop** — click the 🎤 orb, speak, and the agent replies aloud, then re-arms for the next turn
+- **Steer / follow-up support** — speak again while the agent is mid-turn and the message is *steered into the running turn* (Codex-style, appended at the next tool call), not queued
 - **Neural speech detection** — [Silero VAD](https://github.com/ricky0123/vad-web) (WASM/ONNX) in the browser; no fragile RMS thresholds
 - **Local STT** — uses the WebUI's `/api/transcribe` (faster-whisper, runs locally, free, no API key)
 - **Free TTS** — `/api/tts` with Edge TTS; pick voice (default `en-GB-SoniaNeural`, UK)
