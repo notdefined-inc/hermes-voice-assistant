@@ -135,7 +135,7 @@
   bottom: 80px;
   right: 92px;
   width: 300px;
-  max-height: 440px;
+  max-height: 620px;
   overflow-y: auto;
   border-radius: 16px;
   z-index: 100000;
@@ -185,6 +185,21 @@
   font-size: 11px;
   opacity: 0.5;
   margin-top: 2px;
+}
+
+#va-test-voice {
+  border: 1px solid rgba(128, 128, 128, 0.28);
+  border-radius: 8px;
+  padding: 7px 11px;
+  background: var(--surface2, rgba(128, 128, 128, 0.12));
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+#va-test-voice:disabled {
+  cursor: wait;
+  opacity: 0.55;
 }
 
 /* Toggle switch */

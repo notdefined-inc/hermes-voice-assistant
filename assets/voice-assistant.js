@@ -31,18 +31,32 @@
     autoListen: true,
     autoListenDelay: 500,
 
+    // WhisperLiveKit supplies provisional text while speech is still arriving.
+    // Silero's complete utterance still goes through /api/transcribe for the
+    // authoritative final text, avoiding unstable end-of-stream hypotheses.
+    streamingSttEnabled: true,
+    streamingSttHost: 'notdefined.tail8da646.ts.net',
+    streamingSttPort: 7790,
+    streamingSttSecure: true,
+    streamingSttLanguage: 'auto',
+
     ttsEnabled: true,
-    ttsEngine: 'edge',       // edge (default, no key) | openai | elevenlabs | browser
+    ttsEngine: 'edge',       // edge | openai | elevenlabs | browser | supertonic-server | supertonic
     ttsRate: '',
     ttsChunkSize: 500,
     // Per-engine voice profiles. ttsVoice is the Edge name (allowlisted by the
     // server); elevenlabsVoice is the ElevenLabs voice_id; openaiVoice is the
-    // OpenAI voice name. The settings panel shows engine-appropriate voices.
+    // OpenAI voice name. Supertonic has its own voice/language/quality controls.
     // NOTE: ElevenLabs default = Adam (pNInz6obpgDQGcFmaJgB), a FREE creator
     // voice. Library voices (e.g. m3yAHyFEFKtbCIM5n7GF) require a paid plan.
     ttsVoice: 'en-GB-SoniaNeural',
     elevenlabsVoice: 'pNInz6obpgDQGcFmaJgB',
     openaiVoice: 'alloy',
+    supertonicVoice: 'F1',
+    supertonicLang: 'na',
+    supertonicSteps: 5,
+    supertonicSpeed: 1.05,
+    supertonicServerMigrationDone: false,
 
     // Speech detection (Silero VAD) — configurable timing. All in milliseconds.
     // preRollMs = audio buffered before speech is confirmed (fixes cut-off starts)
@@ -72,6 +86,17 @@
     phase: 'idle',           // idle | listening | transcribing | processing | speaking
     forcedRecording: false,
     ttsAudio: null,
+    // Mobile Safari/Chrome only allow media playback after an explicit user
+    // gesture. Keep one Audio element and unlock it from the orb/page tap;
+    // creating a fresh Audio after an async TTS fetch loses that activation.
+    playbackAudio: null,
+    audioUnlocked: false,
+    speechUnlocked: false,
+    // Number of VAD speech-start callbacks not yet paired with speech-end or
+    // misfire. Each start immediately holds response finalization, including
+    // the time while the user is still talking.
+    openSpeechCaptures: 0,
+    stopGeneration: 0,
     ttsActive: false,
     responseDone: false,
     responseText: '',
@@ -83,9 +108,109 @@
     evalWasmTested: false,
     panelOpen: false,
     sseHooked: false,
+    liveStt: null,
+    liveSttContext: null,
+    liveSttSource: null,
+    liveSttProcessor: null,
+    liveSttGain: null,
+    liveSttEncoder: null,
+    liveTranscript: '',
+    liveSttErrorShown: false,
   };
 
+  var TURN = new window.VoiceTurnCoordinator({
+    settleMs: 750,
+    onFinal: function (text) {
+      console.log('[VA] TURN onFinal fired: text=' + (text ? text.slice(0, 80) + '…' : '(empty)') + ' expectingReply=' + STATE.expectingReply);
+      STATE.responseDone = true;
+      STATE.responseText = text;
+      if (STATE.expectingReply) finalizeStreamingResponse(text);
+    },
+  });
+  var PLAYBACK = new window.InterruptiblePlayback();
+  var STT_QUEUE = new window.SerialVoiceTaskQueue();
+  var STREAM_TEXT = new window.IncrementalVoiceSentenceBuffer();
+  var STREAM_SPEECH = {
+    streamId: '',
+    sawTokens: false,
+    deferred: [],
+    chain: Promise.resolve(),
+    playbackToken: null,
+    finalizing: false,
+  };
+
+  function activeStreamId() {
+    if (typeof S === 'undefined') return '';
+    return String(S.activeStreamId || (S.session && S.session.active_stream_id) || '');
+  }
+
+  function streamIdFromUrl(url) {
+    try {
+      return new URL(String(url || ''), document.baseURI).searchParams.get('stream_id') || '';
+    } catch (_) { return ''; }
+  }
+
   var LS_KEY = 'va-settings-v3';
+
+  // Tiny valid PCM WAV containing silence. Playing it during the user's tap
+  // grants the persistent Audio element permission for later async replies.
+  var SILENT_WAV = 'data:audio/wav;base64,UklGRiwAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQgAAAAAAAAAAAA=';
+
+  function ensurePlaybackAudio() {
+    if (STATE.playbackAudio) return STATE.playbackAudio;
+    var audio = document.createElement('audio');
+    audio.setAttribute('playsinline', '');
+    audio.setAttribute('webkit-playsinline', '');
+    audio.preload = 'auto';
+    STATE.playbackAudio = audio;
+    return audio;
+  }
+
+  function unlockMobileAudio() {
+    var audio = ensurePlaybackAudio();
+    if (!STATE.audioUnlocked) {
+      try {
+        // The file itself is silent. Keep the element unmuted: Safari may allow
+        // muted autoplay without granting later audible playback permission.
+        audio.muted = false;
+        audio.volume = 1;
+        audio.src = SILENT_WAV;
+        var p = audio.play();
+        if (p && typeof p.then === 'function') {
+          p.then(function () {
+            audio.pause();
+            audio.currentTime = 0;
+            audio.muted = false;
+            STATE.audioUnlocked = true;
+            console.log('[VA] Mobile audio playback unlocked');
+          }).catch(function (err) {
+            audio.muted = false;
+            console.warn('[VA] Mobile audio unlock deferred:', err);
+          });
+        } else {
+          audio.muted = false;
+          STATE.audioUnlocked = true;
+        }
+      } catch (err) {
+        audio.muted = false;
+        console.warn('[VA] Mobile audio unlock failed:', err);
+      }
+    }
+
+    // Web Speech has a separate autoplay gate on iOS. Prime it from the same
+    // gesture, silently; later Browser-engine utterances can then start.
+    if (!STATE.speechUnlocked && 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window) {
+      try {
+        window.speechSynthesis.resume();
+        var prime = new SpeechSynthesisUtterance(' ');
+        prime.volume = 0;
+        window.speechSynthesis.speak(prime);
+        STATE.speechUnlocked = true;
+      } catch (err2) {
+        console.warn('[VA] Browser speech unlock deferred:', err2);
+      }
+    }
+  }
 
   // ═══════════════════════════════════════════════════════════════
   //  Persistence
@@ -102,6 +227,11 @@
         ttsEngine: CFG.ttsEngine,
         elevenlabsVoice: CFG.elevenlabsVoice,
         openaiVoice: CFG.openaiVoice,
+        supertonicVoice: CFG.supertonicVoice,
+        supertonicLang: CFG.supertonicLang,
+        supertonicSteps: CFG.supertonicSteps,
+        supertonicSpeed: CFG.supertonicSpeed,
+        supertonicServerMigrationDone: CFG.supertonicServerMigrationDone,
         ttsRate: CFG.ttsRate,
         preRollMs: CFG.preRollMs,
         minSpeechMs: CFG.minSpeechMs,
@@ -118,6 +248,19 @@
       var s = JSON.parse(localStorage.getItem(LS_KEY) || '{}');
       for (var k in s) { if (CFG.hasOwnProperty(k)) CFG[k] = s[k]; }
 
+      // v3.8 capture tuning: increase phrase-boundary padding only when the
+      // values are still the former stock defaults. Preserve user adjustments.
+      if (typeof window.migrateVoiceCaptureSettings === 'function') {
+        var tuned = window.migrateVoiceCaptureSettings({
+          preRollMs: CFG.preRollMs,
+          minSpeechMs: CFG.minSpeechMs,
+          endSilenceMs: CFG.endSilenceMs,
+        });
+        CFG.preRollMs = tuned.preRollMs;
+        CFG.minSpeechMs = tuned.minSpeechMs;
+        CFG.endSilenceMs = tuned.endSilenceMs;
+      }
+
       // Migrate v3.1 "speechBudgetChars" → v3.3 truncate {
       if (typeof s.speechBudgetChars === 'number' && s.speechBudgetChars > 0) {
         CFG.truncateEnabled = true;
@@ -131,6 +274,14 @@
       var BROKEN_EL_VOICES = { 'm3yAHyFEFKtbCIM5n7GF': true };  // known paid library voice
       if (CFG.elevenlabsVoice && BROKEN_EL_VOICES[CFG.elevenlabsVoice]) {
         CFG.elevenlabsVoice = 'pNInz6obpgDQGcFmaJgB';  // Adam (free)
+        saveSettings();
+      }
+
+      // v3.7: server-side is now the practical default. Preserve the browser
+      // engine as an explicit opt-in after this one-time migration.
+      if (!CFG.supertonicServerMigrationDone) {
+        if (CFG.ttsEngine === 'supertonic') CFG.ttsEngine = 'supertonic-server';
+        CFG.supertonicServerMigrationDone = true;
         saveSettings();
       }
     } catch (_) {}
@@ -187,18 +338,40 @@
       '<div class="va-toggle' + (CFG.ttsEnabled ? ' va-on' : '') + '" id="va-tts-toggle"><div class="va-toggle-knob"></div></div></div>',
       '<div class="va-setting-row"><div><label>Auto-Listen</label><div class="va-hint">Re-arm after response</div></div>',
       '<div class="va-toggle' + (CFG.autoListen ? ' va-on' : '') + '" id="va-auto-toggle"><div class="va-toggle-knob"></div></div></div>',
+      '<div class="va-setting-row"><div><label>Live transcription</label><div class="va-hint">Show partial words while speaking</div></div>',
+      '<div class="va-toggle' + (CFG.streamingSttEnabled ? ' va-on' : '') + '" id="va-live-stt-toggle"><div class="va-toggle-knob"></div></div></div>',
       '<div class="va-setting-row"><div><label>Sensitivity</label><div class="va-hint">← Less sensitive · More →</div></div>',
       '<div class="va-slider-row"><input type="range" min="1" max="10" value="' + sensVal + '" id="va-sens-slider">',
       '<span class="va-slider-val" id="va-sens-val">' + sensVal + '</span></div></div>',
-      '<div class="va-setting-row"><div><label>TTS Engine</label><div class="va-hint">Edge = free, no key. Others need a server API key</div></div>',
+      '<div class="va-setting-row"><div><label>TTS Engine</label><div class="va-hint" id="va-engine-hint">Edge = free, no key</div></div>',
       '<select id="va-engine-select">',
         '<option value="edge"' + (CFG.ttsEngine === 'edge' ? ' selected' : '') + '>Edge (free)</option>',
         '<option value="openai"' + (CFG.ttsEngine === 'openai' ? ' selected' : '') + '>OpenAI</option>',
         '<option value="elevenlabs"' + (CFG.ttsEngine === 'elevenlabs' ? ' selected' : '') + '>ElevenLabs</option>',
         '<option value="browser"' + (CFG.ttsEngine === 'browser' ? ' selected' : '') + '>Browser (client)</option>',
+        '<option value="supertonic-server"' + (CFG.ttsEngine === 'supertonic-server' ? ' selected' : '') + '>Supertonic 3 (server · recommended)</option>',
+        '<option value="supertonic"' + (CFG.ttsEngine === 'supertonic' ? ' selected' : '') + '>Supertonic 3 (browser · 400 MB)</option>',
       '</select></div>',
       '<div class="va-setting-row"><div><label>Voice</label><div class="va-hint" id="va-voice-hint">Choose a voice for the selected engine</div></div>',
       '<div id="va-voice-control">' + voiceControlHTML() + '</div></div>',
+      '<div class="va-setting-row"><div><label>Playback check</label><div class="va-hint">Tap once on mobile to unlock and test audio</div></div>',
+      '<button type="button" id="va-test-voice">Test voice</button></div>',
+      '<div class="va-setting-row" id="va-supertonic-options" style="display:' + ((CFG.ttsEngine === 'supertonic' || CFG.ttsEngine === 'supertonic-server') ? 'flex' : 'none') + '"><div><label>Language</label><div class="va-hint">Auto/mixed is best for Hinglish</div></div>',
+      '<select id="va-supertonic-lang-select">',
+        '<option value="na"' + (CFG.supertonicLang === 'na' ? ' selected' : '') + '>Auto / mixed (na)</option>',
+        '<option value="en"' + (CFG.supertonicLang === 'en' ? ' selected' : '') + '>English</option>',
+        '<option value="hi"' + (CFG.supertonicLang === 'hi' ? ' selected' : '') + '>Hindi</option>',
+      '</select></div>',
+      '<div class="va-setting-row" id="va-supertonic-quality" style="display:' + ((CFG.ttsEngine === 'supertonic' || CFG.ttsEngine === 'supertonic-server') ? 'flex' : 'none') + '"><div><label>Quality</label><div class="va-hint">More steps sound better but take longer</div></div>',
+      '<select id="va-supertonic-steps-select">',
+        '<option value="5"' + (CFG.supertonicSteps === 5 ? ' selected' : '') + '>Fast (5)</option>',
+        '<option value="8"' + (CFG.supertonicSteps === 8 ? ' selected' : '') + '>Balanced (8)</option>',
+        '<option value="10"' + (CFG.supertonicSteps === 10 ? ' selected' : '') + '>High (10)</option>',
+        '<option value="12"' + (CFG.supertonicSteps === 12 ? ' selected' : '') + '>Very high (12)</option>',
+      '</select></div>',
+      '<div class="va-setting-row" id="va-supertonic-speed" style="display:' + ((CFG.ttsEngine === 'supertonic' || CFG.ttsEngine === 'supertonic-server') ? 'flex' : 'none') + '"><div><label>Speed</label><div class="va-hint">Recommended range: 0.9–1.5</div></div>',
+      '<div class="va-slider-row"><input type="range" min="0.7" max="2" step="0.05" value="' + CFG.supertonicSpeed + '" id="va-supertonic-speed-slider">',
+      '<span class="va-slider-val" id="va-supertonic-speed-val">' + Number(CFG.supertonicSpeed).toFixed(2) + '×</span></div></div>',
       '<div class="va-setting-row"><div><label>Start Pre-roll</label><div class="va-hint">Audio kept before speech is confirmed (fixes cut-off starts)</div></div>',
       '<div class="va-slider-row"><input type="range" min="0" max="900" step="50" value="' + CFG.preRollMs + '" id="va-preroll-slider">',
       '<span class="va-slider-val" id="va-preroll-val">' + CFG.preRollMs + 'ms</span></div></div>',
@@ -214,7 +387,7 @@
       '<div class="va-toggle' + (CFG.truncateEnabled ? ' va-on' : '') + '" id="va-truncate-toggle"><div class="va-toggle-knob"></div></div></div>',
       '<div class="va-setting-row" id="va-truncate-row" style="display:' + (CFG.truncateEnabled ? 'flex' : 'none') + '"><div><label>Max chars</label></div>',
       '<input type="number" id="va-truncate-input" min="60" max="4000" step="10" value="' + CFG.truncateChars + '" style="width:90px;"></div>',
-      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v3.5 · Silero VAD · SSE Hook · Pipelined TTS · Double-click for settings</div>',
+      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v4.1 · Live STT · Sentence-streaming TTS · Barge-in</div>',
     ].join('');
   }
 
@@ -251,6 +424,19 @@
     if (CFG.ttsEngine === 'browser') {
       return '<input type="text" id="va-voice-input" value="' + (CFG.ttsVoice || '') + '" placeholder="e.g. en-GB, or voice name" style="width:180px;" spellcheck="false">';
     }
+    if (CFG.ttsEngine === 'supertonic' || CFG.ttsEngine === 'supertonic-server') {
+      var supertonicVoices = [
+        ['M1', 'Male 1'], ['M2', 'Male 2'], ['M3', 'Male 3'], ['M4', 'Male 4'], ['M5', 'Male 5'],
+        ['F1', 'Female 1'], ['F2', 'Female 2'], ['F3', 'Female 3'], ['F4', 'Female 4'], ['F5', 'Female 5']
+      ];
+      var supertonicOptions = '<select id="va-voice-select">';
+      for (var sv = 0; sv < supertonicVoices.length; sv++) {
+        supertonicOptions += '<option value="' + supertonicVoices[sv][0] + '"' +
+          (CFG.supertonicVoice === supertonicVoices[sv][0] ? ' selected' : '') + '>' +
+          supertonicVoices[sv][1] + '</option>';
+      }
+      return supertonicOptions + '</select>';
+    }
     // edge (default)
     return '<select id="va-voice-select"><option value="">Default</option>' +
       '<option value="en-US-JennyNeural"' + (CFG.ttsVoice === 'en-US-JennyNeural' ? ' selected' : '') + '>Jenny (US)</option>' +
@@ -269,8 +455,17 @@
       if (CFG.ttsEngine === 'elevenlabs') hint.textContent = 'Paste an ElevenLabs voice_id';
       else if (CFG.ttsEngine === 'openai') hint.textContent = 'Choose an OpenAI voice name';
       else if (CFG.ttsEngine === 'browser') hint.textContent = 'Lang tag (e.g. en-GB) or OS voice name';
+      else if (CFG.ttsEngine === 'supertonic-server') hint.textContent = 'Server-side Supertonic voice style (M1–M5 / F1–F5)';
+      else if (CFG.ttsEngine === 'supertonic') hint.textContent = 'Browser-side Supertonic voice style (M1–M5 / F1–F5)';
       else hint.textContent = 'Choose an Edge (Microsoft) neural voice';
     }
+    var engineHint = document.getElementById('va-engine-hint');
+    if (engineHint) engineHint.textContent = CFG.ttsEngine === 'supertonic-server'
+      ? 'Runs on the VPS; clients download only generated WAV audio'
+      : (CFG.ttsEngine === 'supertonic'
+        ? 'Optional browser mode; downloads about 400 MB and may fail on mobile'
+        : (CFG.ttsEngine === 'edge' ? 'Edge = free, no key' : 'The selected engine may need a server API key'));
+    refreshSupertonicOptions();
     wireVoiceControl();
   }
 
@@ -293,6 +488,9 @@
             CFG.elevenlabsVoice = sel.value;
             saveSettings();
           }
+        } else if (CFG.ttsEngine === 'supertonic' || CFG.ttsEngine === 'supertonic-server') {
+          CFG.supertonicVoice = sel.value;
+          saveSettings();
         }
       });
       return;
@@ -308,6 +506,34 @@
     }
   }
 
+  function refreshSupertonicOptions() {
+    var visible = CFG.ttsEngine === 'supertonic' || CFG.ttsEngine === 'supertonic-server';
+    ['va-supertonic-options', 'va-supertonic-quality', 'va-supertonic-speed'].forEach(function (id) {
+      var row = document.getElementById(id);
+      if (row) row.style.display = visible ? 'flex' : 'none';
+    });
+  }
+
+  function wireSupertonicControls() {
+    var lang = document.getElementById('va-supertonic-lang-select');
+    if (lang) lang.addEventListener('change', function () {
+      CFG.supertonicLang = lang.value;
+      saveSettings();
+    });
+    var steps = document.getElementById('va-supertonic-steps-select');
+    if (steps) steps.addEventListener('change', function () {
+      CFG.supertonicSteps = parseInt(steps.value, 10) || 5;
+      saveSettings();
+    });
+    var speed = document.getElementById('va-supertonic-speed-slider');
+    if (speed) speed.addEventListener('input', function () {
+      CFG.supertonicSpeed = parseFloat(speed.value) || 1.05;
+      var label = document.getElementById('va-supertonic-speed-val');
+      if (label) label.textContent = CFG.supertonicSpeed.toFixed(2) + '×';
+      saveSettings();
+    });
+  }
+
   function wirePanel() {
     function bindToggle(id, key) {
       var el = document.getElementById(id);
@@ -316,6 +542,14 @@
     }
     bindToggle('va-tts-toggle', 'ttsEnabled');
     bindToggle('va-auto-toggle', 'autoListen');
+    var liveToggle = document.getElementById('va-live-stt-toggle');
+    if (liveToggle) liveToggle.addEventListener('click', function () {
+      CFG.streamingSttEnabled = !CFG.streamingSttEnabled;
+      liveToggle.classList.toggle('va-on', CFG.streamingSttEnabled);
+      if (!CFG.streamingSttEnabled) closeLiveSttCapture();
+      else if (STATE.audioStream) ensureLiveSttCapture();
+      saveSettings();
+    });
 
     // Crisp Replies toggle: make the AGENT answer short & direct via prompt.
     var crisp = document.getElementById('va-crisp-toggle');
@@ -369,6 +603,23 @@
       saveSettings();
     });
 
+    var testVoice = document.getElementById('va-test-voice');
+    if (testVoice) testVoice.addEventListener('click', function (event) {
+      event.preventDefault();
+      unlockMobileAudio();
+      testVoice.disabled = true;
+      testVoice.textContent = 'Loading…';
+      speakText('Voice playback is working.').then(function () {
+        showToast('Voice: Playback test passed');
+      }).catch(function (err) {
+        console.error('[VA] Playback test failed:', err);
+        showToast('Voice: Playback test failed — check browser audio permission', 5000);
+      }).finally(function () {
+        testVoice.disabled = false;
+        testVoice.textContent = 'Test voice';
+      });
+    });
+
     // VAD timing sliders — dynamic-range maps ms → frames at init/update time.
     bindRange('va-preroll-slider', 'va-preroll-val', 'preRollMs', 0, 900, 'ms');
     bindRange('va-minspeech-slider', 'va-minspeech-val', 'minSpeechMs', 100, 1200, 'ms');
@@ -376,6 +627,7 @@
 
     // Attach handlers to the engine-specific voice control rendered at build.
     wireVoiceControl();
+    wireSupertonicControls();
   }
 
   // Generic range-slider binding: updates CFG[key], per-second label, saves,
@@ -433,10 +685,12 @@
       case 'listening':
         orb.innerHTML = '🎙️'; orb.classList.add('va-listening');
         levelBar.classList.add('va-visible');
-        statusLabel.textContent = 'Listening…'; statusLabel.classList.add('va-visible'); break;
+        statusLabel.textContent = STATE.liveTranscript ? liveTranscriptStatus('Listening') : 'Listening…';
+        statusLabel.classList.add('va-visible'); break;
       case 'transcribing':
         orb.innerHTML = '⏳'; orb.classList.add('va-processing');
-        statusLabel.textContent = 'Transcribing…'; statusLabel.classList.add('va-visible'); break;
+        statusLabel.textContent = STATE.liveTranscript ? liveTranscriptStatus('Finalizing') : 'Transcribing…';
+        statusLabel.classList.add('va-visible'); break;
       case 'processing':
         orb.innerHTML = '🤖'; orb.classList.add('va-processing');
         statusLabel.textContent = 'Thinking…'; statusLabel.classList.add('va-visible'); break;
@@ -465,6 +719,12 @@
     else console.log('[VA] ' + msg);
   }
 
+  function liveTranscriptStatus(prefix) {
+    var text = String(STATE.liveTranscript || '').trim();
+    if (text.length > 120) text = '…' + text.slice(-119);
+    return prefix + ' · ' + text;
+  }
+
   // ═══════════════════════════════════════════════════════════════
   //  SSE Hook — definitive response completion
   // ═══════════════════════════════════════════════════════════════
@@ -478,9 +738,26 @@
 
     function PatchedES(url, config) {
       var es = new OrigES(url, config);
+      var streamId = streamIdFromUrl(url);
+      if (streamId) TURN.bindStream(streamId);
+
+      es.addEventListener('token', function (e) {
+        if (!STATE.expectingReply || !streamId) return;
+        try {
+          var tokenData = JSON.parse(e.data);
+          var delta = String((tokenData && tokenData.text) || '');
+          if (!delta) return;
+          if (!TURN.bindStream(streamId)) return;
+          if (!STREAM_SPEECH.sawTokens) console.log('[VA] First token received: streamId=' + streamId + ' delta=' + delta.slice(0, 40));
+          armReplyWatchdog();
+          acceptStreamingDelta(streamId, delta);
+        } catch (err) {
+          console.warn('[VA] SSE token parse error:', err);
+        }
+      });
 
       es.addEventListener('done', function (e) {
-        console.log('[VA] SSE done event received');
+        console.log('[VA] SSE done event received, streamId=' + streamId);
         try {
           var data = JSON.parse(e.data);
           var msgs = (data.session && data.session.messages) || [];
@@ -490,17 +767,17 @@
           }
           var text = lastAsst ? (lastAsst.content || '').trim() : '';
           text = text.replace(/ thinking[\s\S]*?<\/think>/g, '').trim();
+          console.log('[VA] SSE done: text=' + (text ? text.slice(0, 80) + '…' : '(empty)') + ' expectingReply=' + STATE.expectingReply);
 
-          STATE.responseDone = true;
           STATE.responseText = text;
 
           if (STATE.expectingReply) {
-            onAgentResponseComplete(text);
+            var accepted = TURN.noteDone(text, streamId);
+            console.log('[VA] TURN.noteDone returned: ' + accepted + ' snap=' + JSON.stringify(TURN.snapshot()));
           }
         } catch (err) {
-          console.warn('[VA] SSE done parse error, triggering anyway:', err);
-          STATE.responseDone = true;
-          if (STATE.expectingReply) onAgentResponseComplete('');
+          console.warn('[VA] SSE done parse error, deferring empty completion:', err);
+          if (STATE.expectingReply) TURN.noteDone('', streamId);
         }
       });
 
@@ -547,6 +824,112 @@
         resolve(false);
       }
     });
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  Live partial STT — PCM stream to WhisperLiveKit
+  // ═══════════════════════════════════════════════════════════════
+
+  function liveSttUrl() {
+    var scheme = (CFG.streamingSttSecure || location.protocol === 'https:') ? 'wss:' : 'ws:';
+    var host = CFG.streamingSttHost || location.hostname || '127.0.0.1';
+    return scheme + '//' + host + ':' + CFG.streamingSttPort + '/asr?language=' +
+      encodeURIComponent(CFG.streamingSttLanguage || 'auto') + '&mode=full';
+  }
+
+  async function ensureLiveSttCapture() {
+    if (!CFG.streamingSttEnabled || !STATE.audioStream || !window.LiveSttSession) return false;
+    if (STATE.liveSttContext && STATE.liveSttProcessor && STATE.liveStt) {
+      if (STATE.liveSttContext.state === 'suspended') {
+        try { await STATE.liveSttContext.resume(); } catch (_) {}
+      }
+      return true;
+    }
+
+    try {
+      var AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) throw new Error('Web Audio unavailable');
+      var ctx = new AudioCtx();
+      try { await ctx.resume(); } catch (_) {}
+      var source = ctx.createMediaStreamSource(STATE.audioStream);
+      // ScriptProcessor is intentionally used for broad mobile compatibility.
+      // The work is tiny (mono resample + int16 conversion); inference stays on VPS.
+      var processor = ctx.createScriptProcessor(4096, 1, 1);
+      var gain = ctx.createGain();
+      gain.gain.value = 0;
+      var encoder = new window.StreamingPcm16Encoder(ctx.sampleRate, 16000);
+      var session = new window.LiveSttSession({
+        url: liveSttUrl(),
+        preRollBytes: Math.max(16000, Math.round(16000 * 2 * CFG.preRollMs / 1000)),
+        onTranscript: function (text) {
+          STATE.liveTranscript = text;
+          if (statusLabel && (STATE.phase === 'listening' || STATE.phase === 'transcribing')) {
+            statusLabel.textContent = liveTranscriptStatus(STATE.phase === 'transcribing' ? 'Finalizing' : 'Listening');
+            statusLabel.classList.add('va-visible');
+          }
+        },
+        onError: function (err) {
+          console.warn('[VA] Live STT unavailable; final batch STT remains active:', err);
+          if (!STATE.liveSttErrorShown) {
+            STATE.liveSttErrorShown = true;
+            showToast('Voice: Live transcript unavailable — final transcription still works', 4000);
+          }
+        },
+      });
+      processor.onaudioprocess = function (event) {
+        if (!STATE.liveStt || STATE.liveStt !== session) return;
+        var pcm = encoder.encode(event.inputBuffer.getChannelData(0));
+        if (pcm.byteLength) session.pushPcm(pcm);
+      };
+      source.connect(processor);
+      processor.connect(gain);
+      gain.connect(ctx.destination);
+      STATE.liveSttContext = ctx;
+      STATE.liveSttSource = source;
+      STATE.liveSttProcessor = processor;
+      STATE.liveSttGain = gain;
+      STATE.liveSttEncoder = encoder;
+      STATE.liveStt = session;
+      console.log('[VA] Live STT PCM capture initialized at %d Hz', ctx.sampleRate);
+      return true;
+    } catch (err) {
+      console.warn('[VA] Live STT capture init failed:', err);
+      return false;
+    }
+  }
+
+  function startLiveSttUtterance() {
+    STATE.liveTranscript = '';
+    if (!CFG.streamingSttEnabled) return;
+    ensureLiveSttCapture().then(function (ready) {
+      if (ready && STATE.liveStt) STATE.liveStt.start();
+    });
+  }
+
+  function finishLiveSttUtterance() {
+    if (STATE.liveStt) STATE.liveStt.finish();
+  }
+
+  function cancelLiveSttUtterance() {
+    if (STATE.liveStt) STATE.liveStt.close();
+    STATE.liveTranscript = '';
+  }
+
+  function closeLiveSttCapture() {
+    cancelLiveSttUtterance();
+    if (STATE.liveSttProcessor) {
+      try { STATE.liveSttProcessor.disconnect(); } catch (_) {}
+      STATE.liveSttProcessor.onaudioprocess = null;
+    }
+    if (STATE.liveSttSource) { try { STATE.liveSttSource.disconnect(); } catch (_) {} }
+    if (STATE.liveSttGain) { try { STATE.liveSttGain.disconnect(); } catch (_) {} }
+    if (STATE.liveSttContext) { try { STATE.liveSttContext.close(); } catch (_) {} }
+    STATE.liveStt = null;
+    STATE.liveSttContext = null;
+    STATE.liveSttSource = null;
+    STATE.liveSttProcessor = null;
+    STATE.liveSttGain = null;
+    STATE.liveSttEncoder = null;
   }
 
   async function loadVAD() {
@@ -596,10 +979,35 @@
         redemptionFrames: Math.max(2, Math.round(CFG.endSilenceMs * framesPerMs)),
         onSpeechStart: function () {
           console.log('[VA] Speech start');
-          setPhase('listening'); // stay armed; buffer is owned by Silero
+          startLiveSttUtterance();
+          // Full-duplex barge-in: stop the current utterance immediately but keep
+          // the conversation session alive. The captured speech becomes the next
+          // natural turn (or a steer if the agent is still running).
+          if (STATE.ttsActive || STATE.phase === 'speaking') {
+            console.log('[VA] Barge-in — interrupting TTS');
+            stopTTS();
+            clearExpectingReply();
+            TURN.reset();
+            resetStreamingResponse('', false);
+          }
+          STATE.openSpeechCaptures += 1;
+          TURN.beginStt();
+          // Keep the microphone visibly armed without pretending the active
+          // transcription/agent turn stopped. A follow-up may become a steer.
+          if (STATE.phase !== 'transcribing' && STATE.phase !== 'processing') {
+            setPhase('listening');
+          } else if (statusLabel) {
+            statusLabel.textContent = STATE.phase === 'transcribing'
+              ? 'Listening · transcribing previous…'
+              : 'Listening · response in progress…';
+            statusLabel.classList.add('va-visible');
+          }
         },
         onSpeechEnd: function (audio) {
           console.log('[VA] Speech end (%d samples)', audio ? audio.length : 0);
+          finishLiveSttUtterance();
+          if (STATE.openSpeechCaptures > 0) STATE.openSpeechCaptures -= 1;
+          else TURN.beginStt(); // defensive: keep begin/end balanced
           // Silero hands us the full utterance INCLUDING pre-roll padding —
           // encode to WAV ourselves; never use MediaRecorder (it starts too
           // late and loses the first ~200-400ms of speech).
@@ -607,10 +1015,14 @@
         },
         onVADMisfire: function () {
           console.log('[VA] VAD misfire — too short');
-          resetSileroMic();
+          cancelLiveSttUtterance();
+          if (STATE.openSpeechCaptures > 0) STATE.openSpeechCaptures -= 1;
+          TURN.endStt();
+          recoverAfterStt();
         },
       });
 
+      await ensureLiveSttCapture();
       console.log('[VA] Silero VAD initialized');
       return STATE.vad;
     } catch (e) {
@@ -671,7 +1083,7 @@
 
   // Called by Silero's onSpeechEnd with the captured utterance.
   function finishWithAudio(audio) {
-    if (!audio || !audio.length) { resetSileroMic(); return; }
+    if (!audio || !audio.length) { TURN.endStt(); recoverAfterStt(); return; }
 
     // Guard: require the utterance to actually contain speech energy, else
     // the "silence/misfire → instant transcribe" loop would spam the STT.
@@ -682,25 +1094,48 @@
     }
     if (peak < 0.002) {  // effectively silent clip
       console.log('[VA] utterance too quiet, ignoring');
-      resetSileroMic();
+      TURN.endStt();
+      recoverAfterStt();
       return;
     }
 
     var blob = encodeWav(audio);
-    if (blob.size < 1500) { resetSileroMic(); return; }
+    if (blob.size < 1500) { TURN.endStt(); recoverAfterStt(); return; }
 
     setPhase('transcribing');
-    transcribeAudio(blob).then(function (text) {
+    var generation = STATE.stopGeneration;
+    // The VPS has only two CPUs. Running several faster-whisper jobs at once
+    // made them 3-4x slower and allowed later utterances to finish first.
+    // Queue inference in speech order while Silero keeps capturing new audio.
+    STT_QUEUE.add(function () {
+      if (generation !== STATE.stopGeneration) return '';
+      return window.withVoiceTimeout(function () { return transcribeAudio(blob); }, 45000);
+    }).then(function (text) {
+      TURN.endStt();
+      if (generation !== STATE.stopGeneration) return;
       if (text && text.trim().length > 0) {
         sendToAgent(text.trim());
       } else {
-        resetSileroMic();
+        recoverAfterStt();
       }
     }).catch(function (err) {
+      TURN.endStt();
+      if (generation !== STATE.stopGeneration) return;
       console.error('[VA] Transcribe failed:', err);
       showToast('Voice: Transcription failed');
-      resetSileroMic();
+      recoverAfterStt();
     });
+  }
+
+  function recoverAfterStt() {
+    var phase = window.voicePhaseAfterStt({
+      pendingStt: TURN.snapshot().pendingStt,
+      expectingReply: STATE.expectingReply,
+      ttsActive: STATE.ttsActive,
+    });
+    setPhase(phase);
+    if (TURN.snapshot().pendingStt === 0) releaseDeferredStreamingSpeech();
+    if (phase === 'listening') resetSileroMic();
   }
 
   function resetSileroMic() {
@@ -727,35 +1162,107 @@
     return data.transcript || '';
   }
 
-  // Send user's voice text to the agent. If the agent is already mid-turn
-  // (busy), steer (append) the message into the active run — Codex-style —
-  // instead of queueing it as a separate turn. Falls back to a normal send
-  // when the agent is idle or steer is unavailable.
+  // Send speech into one conversational turn. A follow-up that finishes STT
+  // during the several-second /api/chat/start gap waits for the stream id and
+  // becomes a steer instead of leaking into the normal message queue.
   function sendToAgent(text) {
+    var liveStream = activeStreamId();
+    var hadOpenTurn = STATE.expectingReply && TURN.snapshot().waiting;
+    console.log('[VA] sendToAgent: text="' + text.slice(0, 60) + '" liveStream=' + liveStream + ' hadOpenTurn=' + hadOpenTurn +
+      ' expectingReply=' + STATE.expectingReply + ' turnWaiting=' + TURN.snapshot().waiting);
+    // Voice may join a turn started from the keyboard. Treat that as steerable
+    // conversation too rather than letting the busy composer choose a mode.
+    if (!hadOpenTurn && liveStream) {
+      TURN.beginAgentTurn();
+      TURN.bindStream(liveStream);
+      hadOpenTurn = true;
+    }
     setPhase('processing');
     STATE.responseDone = false;
     STATE.responseText = '';
     STATE.expectingReply = true;
+    armReplyWatchdog();
 
-    // Crisp Replies: append a directive so the AGENT answers short & direct.
     var outText = text;
     if (CFG.crispPrompt && CFG.crispDirective) {
       outText = text + '\n\n(Instruction: ' + CFG.crispDirective + ')';
     }
 
-    var isBusy = typeof S !== 'undefined' && S.busy && (S.activeStreamId || (S.session && S.session.active_stream_id));
-    var canSteer = isBusy && typeof _trySteer === 'function';
-
-    if (canSteer) {
-      console.log('[VA] Agent busy — steering message into active turn');
-      _trySteer(outText, /*explicitSteer=*/false).catch(function (err) {
-        console.warn('[VA] steer failed, falling back to send():', err);
-        sendViaComposer(outText);
-      });
+    if (hadOpenTurn) {
+      deliverNaturalFollowup(outText);
       return;
     }
 
+    var previousStream = TURN.snapshot().currentStreamId || activeStreamId();
+    resetStreamingResponse('', true);
+    TURN.beginAgentTurn({ afterStreamId: previousStream });
     sendViaComposer(outText);
+  }
+
+  function deliverNaturalFollowup(outText) {
+    TURN.beginDelivery();
+    window.waitForVoiceSteerTarget(function () {
+      var snap = TURN.snapshot();
+      return {
+        streamId: activeStreamId(),
+        turnCompleted: snap.turnCompleted,
+      };
+    }, { timeoutMs: 10000, pollMs: 50 }).then(function (targetStream) {
+      if (!targetStream || typeof _trySteer !== 'function') {
+        return startFreshFollowup(outText);
+      }
+
+      TURN.bindStream(targetStream);
+      console.log('[VA] Active stream ready — steering conversational follow-up');
+      return _trySteer(outText, /*explicitSteer=*/false).then(function (accepted) {
+        if (accepted) {
+          clearVoiceComposerDraft(outText);
+          resetStreamingResponse(targetStream, true);
+          TURN.resolveDelivery('steer');
+          setPhase('processing');
+          return;
+        }
+        console.log('[VA] Steer closed before delivery — continuing as next turn');
+        return startFreshFollowup(outText);
+      });
+    }).catch(function (err) {
+      console.warn('[VA] Natural follow-up routing failed:', err);
+      return startFreshFollowup(outText);
+    });
+  }
+
+  function startFreshFollowup(outText) {
+    var previousStream = TURN.snapshot().currentStreamId || activeStreamId();
+    clearVoiceComposerDraft(outText);
+    return waitForAgentIdle(15000).then(function () {
+      resetStreamingResponse('', true);
+      TURN.beginAgentTurn({ afterStreamId: previousStream });
+      TURN.resolveDelivery('new-turn');
+      sendViaComposer(outText);
+    });
+  }
+
+  function waitForAgentIdle(timeoutMs) {
+    var started = Date.now();
+    return new Promise(function (resolve) {
+      function check() {
+        var busy = typeof S !== 'undefined' && (S.busy || activeStreamId());
+        if (!busy || Date.now() - started >= timeoutMs) { resolve(!busy); return; }
+        setTimeout(check, 50);
+      }
+      check();
+    });
+  }
+
+  function clearVoiceComposerDraft(text) {
+    var textarea = document.getElementById('msg');
+    if (!textarea) return;
+    var value = String(textarea.value || '').trim();
+    var plain = String(text || '').trim();
+    if (value === plain || value === '/steer ' + plain) {
+      textarea.value = '';
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    }
   }
 
   // Inject into the composer and trigger the WebUI's global send().
@@ -773,43 +1280,151 @@
         textarea.dispatchEvent(evt);
       }
 
-      // Watchdog: if SSE done doesn't fire in 3 min, recover
-      setTimeout(function () {
-        if (STATE.expectingReply && !STATE.responseDone) {
-          console.warn('[VA] Watchdog: SSE done not received in 3 min, recovering');
-          clearExpectingReply();
-          setPhase('idle');
-        }
-      }, 180000);
     }, 100);
+  }
+
+  function armReplyWatchdog() {
+    if (STATE.replyWatchdog) clearTimeout(STATE.replyWatchdog);
+    STATE.replyWatchdog = setTimeout(function () {
+      STATE.replyWatchdog = null;
+      if (!STATE.expectingReply || STATE.responseDone) return;
+      console.warn('[VA] Watchdog: response did not complete, recovering voice state');
+      TURN.reset();
+      resetStreamingResponse('', true);
+      clearExpectingReply();
+      setPhase('idle');
+      if (CFG.autoListen) setTimeout(nextListen, CFG.autoListenDelay);
+    }, 180000);
   }
 
   // Stop awaiting a reply (after TTS finishes or on abort).
   function clearExpectingReply() {
     STATE.expectingReply = false;
+    if (STATE.replyWatchdog) {
+      clearTimeout(STATE.replyWatchdog);
+      STATE.replyWatchdog = null;
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════
-  //  Response Complete → TTS
+  //  Streaming response text → sentence TTS
   // ═══════════════════════════════════════════════════════════════
 
-  function onAgentResponseComplete(text) {
-    if (!CFG.ttsEnabled || !text.trim()) {
-      clearExpectingReply();
-      if (CFG.autoListen) setTimeout(nextListen, CFG.autoListenDelay);
-      else setPhase('idle');
+  function resetStreamingResponse(streamId, cancelPlayback) {
+    if (cancelPlayback) stopTTS();
+    STREAM_TEXT.reset(streamId || '');
+    STREAM_SPEECH.streamId = String(streamId || '');
+    STREAM_SPEECH.sawTokens = false;
+    STREAM_SPEECH.deferred = [];
+    STREAM_SPEECH.chain = Promise.resolve();
+    STREAM_SPEECH.playbackToken = null;
+    STREAM_SPEECH.finalizing = false;
+  }
+
+  function acceptStreamingDelta(streamId, delta) {
+    if (STREAM_SPEECH.streamId !== streamId) resetStreamingResponse(streamId, true);
+    STREAM_SPEECH.sawTokens = true;
+    var sentences = STREAM_TEXT.push(delta);
+    if (!sentences.length) return;
+    var snap = TURN.snapshot();
+    if (snap.pendingStt || snap.pendingDelivery) {
+      Array.prototype.push.apply(STREAM_SPEECH.deferred, sentences);
+      return;
+    }
+    for (var i = 0; i < sentences.length; i++) queueStreamingSentence(sentences[i]);
+  }
+
+  function releaseDeferredStreamingSpeech() {
+    var snap = TURN.snapshot();
+    if (snap.pendingStt || snap.pendingDelivery || !STREAM_SPEECH.deferred.length) return;
+    var ready = STREAM_SPEECH.deferred.splice(0);
+    for (var i = 0; i < ready.length; i++) queueStreamingSentence(ready[i]);
+  }
+
+  function queueStreamingSentence(sentence) {
+    sentence = String(sentence || '').trim();
+    if (!sentence) return;
+    console.log('[VA] queueStreamingSentence: "' + sentence.slice(0, 60) + '" ttsEnabled=' + CFG.ttsEnabled);
+    if (!CFG.ttsEnabled) return;
+    if (STREAM_SPEECH.playbackToken === null || !PLAYBACK.isCurrent(STREAM_SPEECH.playbackToken)) {
+      STREAM_SPEECH.playbackToken = PLAYBACK.begin();
+    }
+    var token = STREAM_SPEECH.playbackToken;
+    var streamId = STREAM_SPEECH.streamId;
+    STREAM_SPEECH.chain = STREAM_SPEECH.chain.catch(function (err) {
+      console.warn('[VA] Streaming TTS chunk failed; continuing:', err);
+    }).then(function () {
+      if (!PLAYBACK.isCurrent(token) || STREAM_SPEECH.streamId !== streamId) return;
+      setPhase('speaking');
+      return speakText(sentence, token).then(function () {
+        if (!PLAYBACK.isCurrent(token) || STREAM_SPEECH.streamId !== streamId) return;
+        if (!STREAM_SPEECH.finalizing && STATE.expectingReply) setPhase('processing');
+      });
+    });
+  }
+
+  function finishVoiceCycle() {
+    clearExpectingReply();
+    setPhase('idle');
+    if (CFG.autoListen) setTimeout(nextListen, CFG.autoListenDelay);
+    else if (STATE.vad) { try { STATE.vad.pause(); } catch (_) {} }
+  }
+
+  function finalizeStreamingResponse(text) {
+    text = String(text || '').trim();
+    console.log('[VA] finalizeStreamingResponse: text=' + (text ? text.slice(0, 80) + '…' : '(empty)') +
+      ' sawTokens=' + STREAM_SPEECH.sawTokens + ' ttsEnabled=' + CFG.ttsEnabled);
+    if (!CFG.ttsEnabled || !text) {
+      finishVoiceCycle();
       return;
     }
 
+    if (!STREAM_SPEECH.sawTokens) {
+      onAgentResponseComplete(text);
+      return;
+    }
+
+    releaseDeferredStreamingSpeech();
+    var tail = STREAM_TEXT.flush();
+    if (tail) queueStreamingSentence(tail);
+    STREAM_SPEECH.finalizing = true;
+    var token = STREAM_SPEECH.playbackToken;
+    STREAM_SPEECH.chain.then(function () {
+      if (token !== null && !PLAYBACK.isCurrent(token)) return;
+      finishVoiceCycle();
+    }).catch(function (err) {
+      console.error('[VA] Streaming response playback failed:', err);
+      finishVoiceCycle();
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  Response Complete → fallback full-response TTS
+  // ═══════════════════════════════════════════════════════════════
+
+  function onAgentResponseComplete(text) {
+    console.log('[VA] onAgentResponseComplete: text=' + (text ? text.slice(0, 80) + '…' : '(empty)') + ' ttsEnabled=' + CFG.ttsEnabled);
+    if (!CFG.ttsEnabled || !text.trim()) {
+      clearExpectingReply();
+      if (CFG.autoListen) setTimeout(nextListen, CFG.autoListenDelay);
+      else { if (STATE.vad) { try { STATE.vad.pause(); } catch (_) {} } setPhase('idle'); }
+      return;
+    }
+
+    var playbackToken = PLAYBACK.begin();
     setPhase('speaking');
-    speakText(text).then(function () {
+    speakText(text, playbackToken).then(function () {
+      if (!PLAYBACK.isCurrent(playbackToken)) return;
       clearExpectingReply();
       setPhase('idle');
       if (CFG.autoListen) setTimeout(nextListen, CFG.autoListenDelay);
+      else if (STATE.vad) { try { STATE.vad.pause(); } catch (_) {} }
     }).catch(function (err) {
+      if (!PLAYBACK.isCurrent(playbackToken)) return;
       console.error('[VA] TTS failed:', err);
       clearExpectingReply();
       setPhase('idle');
+      if (!CFG.autoListen && STATE.vad) { try { STATE.vad.pause(); } catch (_) {} }
     });
   }
 
@@ -880,19 +1495,45 @@
   // Prefetch a chunk's audio while previously-fetched chunks are playing.
   // (Browser engine is handled separately in speakText via SpeechSynthesis.)
   function fetchAudioBlob(text) {
+    if (CFG.ttsEngine === 'supertonic') {
+      if (typeof window._hermesTtsIsRegistered !== 'function' || !window._hermesTtsIsRegistered('supertonic')) {
+        return Promise.reject(new Error('Supertonic local engine is not loaded yet; reload the WebUI once'));
+      }
+      return Promise.resolve(window._hermesTtsSynth('supertonic', text, {
+        voice: CFG.supertonicVoice,
+        lang: CFG.supertonicLang,
+        steps: CFG.supertonicSteps,
+        speed: CFG.supertonicSpeed,
+      })).then(function (buffer) {
+        return URL.createObjectURL(new Blob([buffer], { type: 'audio/wav' }));
+      });
+    }
     var body = { text: text, engine: CFG.ttsEngine };
     // Send the engine-appropriate voice:
-    //  - edge      → Edge neural voice name (server allowlist)
-    //  - openai    → OpenAI voice name
-    //  - elevenlabs → ElevenLabs voice_id
+    //  - edge               → Edge neural voice name (server allowlist)
+    //  - openai             → OpenAI voice name
+    //  - elevenlabs         → ElevenLabs voice_id
+    //  - supertonic-server  → local Supertonic style + synthesis controls
     var voice = CFG.ttsVoice;
     if (CFG.ttsEngine === 'openai') voice = CFG.openaiVoice;
     else if (CFG.ttsEngine === 'elevenlabs') voice = CFG.elevenlabsVoice;
+    else if (CFG.ttsEngine === 'supertonic-server') {
+      voice = CFG.supertonicVoice;
+      body.lang = CFG.supertonicLang;
+      body.steps = CFG.supertonicSteps;
+      body.speed = CFG.supertonicSpeed;
+    }
     if (voice) body.voice = voice;
     if (CFG.ttsRate) body.rate = CFG.ttsRate;
-    return fetch('/api/tts', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-    }).then(function (resp) {
+    var doFetch = function () {
+      return fetch('/api/tts', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+    };
+    var fetchPromise = typeof window.withVoiceRateLimitRetry === 'function'
+      ? window.withVoiceRateLimitRetry(doFetch, 2100)
+      : doFetch();
+    return fetchPromise.then(function (resp) {
       if (!resp.ok) throw new Error('TTS HTTP ' + resp.status);
       return resp.blob();
     }).then(function (blob) {
@@ -900,71 +1541,123 @@
     });
   }
 
-  function playAudioURL(url) {
-    // Browser engine already spoke via SpeechSynthesis — nothing to play here.
-    if (url === null) return Promise.resolve();
+  function playAudioURL(url, playbackToken) {
+    if (url === null) return Promise.resolve(true);
+    if (!PLAYBACK.isCurrent(playbackToken)) {
+      URL.revokeObjectURL(url);
+      return Promise.resolve(false);
+    }
     return new Promise(function (resolve, reject) {
-      var audio = new Audio(url);
-      audio.setAttribute('playsinline', '');
-      audio.onended = function () { URL.revokeObjectURL(url); resolve(); };
-      audio.onerror = function () { URL.revokeObjectURL(url); resolve(); };
+      var audio = ensurePlaybackAudio();
+      var settled = false;
+      function cleanup() {
+        audio.onended = null;
+        audio.onerror = null;
+        PLAYBACK.clearCancel(cancelPlayback);
+        URL.revokeObjectURL(url);
+      }
+      function finish(value) {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(value);
+      }
+      function cancelPlayback() {
+        try { audio.pause(); } catch (_) {}
+        finish(false);
+      }
+      PLAYBACK.onCancel(cancelPlayback);
+      audio.onended = function () { finish(true); };
+      audio.onerror = function () {
+        if (settled) return;
+        settled = true;
+        var mediaError = audio.error;
+        cleanup();
+        reject(new Error('Audio decode/playback failed' + (mediaError ? ' (code ' + mediaError.code + ')' : '')));
+      };
+      audio.muted = false;
+      audio.src = url;
+      audio.load();
       STATE.ttsAudio = audio;
       audio.play().catch(function (err) {
-        URL.revokeObjectURL(url);
+        if (settled) return;
+        settled = true;
+        cleanup();
         console.warn('[VA] TTS play blocked:', err);
-        resolve();
+        showToast('Voice: Tap the microphone once to enable audio');
+        reject(new Error('Browser blocked audio playback: ' + (err.message || err)));
       });
     });
   }
 
-  async function speakText(text) {
+  async function speakText(text, playbackToken) {
+    playbackToken = window.ensureVoicePlaybackToken(PLAYBACK, playbackToken);
     var prose = crispify(text);
     var sentences = splitIntoSentences(prose);
     var chunks = chunkSentences(sentences, CFG.ttsChunkSize);
     STATE.ttsActive = true;
 
-    // Pause VAD during playback — no speech detection while speaking
-    if (STATE.vad) { try { STATE.vad.pause(); } catch (_) {} }
-
-    // Browser engine: SpeechSynthesis queues utterances natively and calls us
-    // back when each ends, so we speak sequentially and wait for the last one.
+    // Keep neural VAD armed during TTS. Browser echo cancellation suppresses
+    // most speaker leakage; genuine speech calls stopTTS() from onSpeechStart.
     if (CFG.ttsEngine === 'browser') {
-      await speakBrowserChunks(chunks);
+      await speakBrowserChunks(chunks, playbackToken);
+      if (!PLAYBACK.isCurrent(playbackToken)) return;
       STATE.ttsActive = false;
-      await new Promise(function (r) { setTimeout(r, 400); });
+      await new Promise(function (r) { setTimeout(r, 250); });
       return;
     }
 
-    // Pipeline: pre-fetch the next blob while the current one plays, so the
-    // Edge TTS latency (~1-3s) is hidden behind playback — no punctuation gaps.
-    var nextFetch = fetchAudioBlob(chunks[0]);
-    for (var i = 0; i < chunks.length; i++) {
-      if (!STATE.ttsActive) break;
-      STATE.ttsIndex = i;
-      var url = await nextFetch;
-      nextFetch = (i + 1 < chunks.length) ? fetchAudioBlob(chunks[i + 1]) : null;
-      await playAudioURL(url);
+    function guardedFetch(chunk) {
+      return fetchAudioBlob(chunk).then(function (url) {
+        if (!PLAYBACK.isCurrent(playbackToken)) {
+          if (url) URL.revokeObjectURL(url);
+          return null;
+        }
+        return url;
+      });
     }
 
-    STATE.ttsActive = false;
+    var nextFetch = guardedFetch(chunks[0]);
+    for (var i = 0; i < chunks.length; i++) {
+      if (!STATE.ttsActive || !PLAYBACK.isCurrent(playbackToken)) break;
+      STATE.ttsIndex = i;
+      var url = await nextFetch;
+      if (!url || !PLAYBACK.isCurrent(playbackToken)) break;
+      nextFetch = (i + 1 < chunks.length) ? guardedFetch(chunks[i + 1]) : null;
+      var completed = await playAudioURL(url, playbackToken);
+      if (!completed) break;
+    }
 
-    // Cooldown for speaker echo decay
-    await new Promise(function (r) { setTimeout(r, 400); });
+    if (!PLAYBACK.isCurrent(playbackToken)) return;
+    STATE.ttsActive = false;
+    await new Promise(function (r) { setTimeout(r, 250); });
   }
 
   // Sequential browser-engine speech via SpeechSynthesis. A token promise
   // resolves when the last queued utterance ends, giving gapless queueing
   // that still respects stopTTS() (which calls speechSynthesis.cancel()).
-  function speakBrowserChunks(chunks) {
+  function speakBrowserChunks(chunks, playbackToken) {
     return new Promise(function (resolve) {
       if (!chunks.length) { resolve(); return; }
       if (!('speechSynthesis' in window)) { resolve(); return; }
 
       var finished = false;
-      function done() { if (!finished) { finished = true; STATE.browserSpeechDone = true; resolve(); } }
+      function done() {
+        if (!finished) {
+          finished = true;
+          PLAYBACK.clearCancel(cancelBrowserSpeech);
+          STATE.browserSpeechDone = true;
+          resolve();
+        }
+      }
+      function cancelBrowserSpeech() {
+        try { window.speechSynthesis.cancel(); } catch (_) {}
+        done();
+      }
+      PLAYBACK.onCancel(cancelBrowserSpeech);
 
       for (var i = 0; i < chunks.length; i++) {
-        if (!STATE.ttsActive) { done(); return; }
+        if (!STATE.ttsActive || !PLAYBACK.isCurrent(playbackToken)) { done(); return; }
         var utter = new SpeechSynthesisUtterance(chunks[i]);
         var voices = window.speechSynthesis.getVoices();
         if (CFG.ttsVoice && voices.length) {
@@ -993,6 +1686,7 @@
   }
 
   function stopTTS() {
+    PLAYBACK.cancel();
     STATE.ttsActive = false;
     if (STATE.ttsAudio) { try { STATE.ttsAudio.pause(); } catch (_) {} STATE.ttsAudio = null; }
     // Browser engine: cancel any queued SpeechSynthesis.
@@ -1011,6 +1705,9 @@
   var DOUBLE_CLICK_MS = 300;   // window to detect a second click
 
   function onOrbClick(e) {
+    // Must run synchronously inside the actual user gesture. The delayed
+    // single-click action is too late for iOS autoplay permission.
+    unlockMobileAudio();
     e.stopPropagation();
 
     // If a single-click action is already pending, this is a double-click →
@@ -1052,6 +1749,11 @@
     console.log('[VA] Stopping — back to idle');
     if (STATE.vad) { try { STATE.vad.pause(); } catch (_) {} }
     stopTTS();
+    closeLiveSttCapture();
+    STATE.stopGeneration += 1;
+    STATE.openSpeechCaptures = 0;
+    TURN.reset();
+    resetStreamingResponse('', false);
     STATE.chunks = [];
     clearExpectingReply();
     setPhase('idle');
@@ -1072,6 +1774,8 @@
       var vad = await loadVAD();
       if (!vad) { setPhase('idle'); return; }
     }
+
+    if (CFG.streamingSttEnabled) await ensureLiveSttCapture();
 
     STATE.responseDone = false;
     STATE.responseText = '';
@@ -1112,11 +1816,15 @@
   function init() {
     loadSettings();
     injectUI();
+    ensurePlaybackAudio();
+    // Capture phase runs even when the orb stops event propagation.
+    document.addEventListener('pointerdown', unlockMobileAudio, { capture: true, passive: true });
+    document.addEventListener('touchend', unlockMobileAudio, { capture: true, passive: true });
     setPhase('idle');
     hookSSE();
     checkCapabilities();
     testWasmEval();
-    console.log('[VA] Voice Assistant v3.0 loaded — Silero VAD + SSE hook + TTS');
+    console.log('[VA] Voice Assistant v4.1 loaded — live partial STT + sentence-streaming TTS + barge-in');
   }
 
   if (document.readyState === 'loading') {
