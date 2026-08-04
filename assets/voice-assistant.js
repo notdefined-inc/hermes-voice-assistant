@@ -1,5 +1,5 @@
 /**
- * Voice Assistant Extension v4.3.8 for Hermes WebUI
+ * Voice Assistant Extension v4.3.9 for Hermes WebUI
  *
  * Battle-tested stack:
  *  - Silero VAD (@ricky0123/vad-web v0.0.24) from CDN — neural network voice
@@ -11,7 +11,14 @@
  *    tied to the active stream; VAD paused during speech output to prevent
  *    self-triggering feedback.
  *
- * v4.3.8: FIX "never starts speaking the first response". Two root causes:
+ * v4.3.9: FIX "steer delivered but never appended / next message does not speak".
+ * Two SSE handlers gated on STATE.expectingReply: (1) the token handler blocked
+ * a steer response's tokens from being queued for TTS when expectingReply had
+ * been cleared (e.g. by barge-in); (2) the done handler silently ignored a
+ * completed response when expectingReply was false. Both now process tokens
+ * and deliver responses regardless of expectingReply state.
+ *
+ * v4.3.9: FIX "never starts speaking the first response". Two root causes:
  * (1) acceptStreamingDelta gated speech on pendingStt — a completed response
  * was deferred into STREAM_SPEECH.deferred while follow-up STT ran, so the
  * user heard nothing of response 1. Gate is now pendingDelivery (steer) only.
@@ -21,45 +28,45 @@
  * (3) Steer path no longer calls resetStreamingResponse(stream, true) which
  * killed in-flight speech; it resets text buffer but keeps the playback chain.
  *
- * v4.3.8: FIX "previous response skipped / only speaks the last ones". A fully
+ * v4.3.9: FIX "previous response skipped / only speaks the last ones". A fully
  * completed answer (SSE done) was HELD while follow-up STT stayed pending, so a
  * later steer could merge. But when the follow-up instead became a fresh turn,
  * beginAgentTurn silently discarded the held response — it was never spoken.
  * New coordinator flushPendingFinal() delivers it before the fresh turn, and
  * startFreshFollowup waits for that speech to finish before resetting.
  *
- * v4.3.8: STT mode selector in settings panel (hybrid / live / batch) +
+ * v4.3.9: STT mode selector in settings panel (hybrid / live / batch) +
  * configurable race-grace window. Panel widened to 360px and grouped into
  * Conversation / Transcription / Speech synthesis sections.
  *
- * v4.3.8: FIX spurious/slow turns: only server-CONFIRMED live STT text may win
- * the race. v4.3.8's race trusted a 20s-timeout partial from WLK's
+ * v4.3.9: FIX spurious/slow turns: only server-CONFIRMED live STT text may win
+ * the race. v4.3.9's race trusted a 20s-timeout partial from WLK's
  * localagreement (measured: "and load will out." sent to agent, correct batch
  * text arrived 15-45s later and was discarded). LiveSttSession now flags
  * confirmedViaReadyStop; unconfirmed timeouts defer to authoritative batch.
  *
- * v4.3.8: RACE live STT vs batch transcription. WLK runs
+ * v4.3.9: RACE live STT vs batch transcription. WLK runs
  * --backend-policy localagreement which takes 20-30s to settle on this 2-vCPU
  * box (measured: ready_to_stop +18s/+27s/+32s, 3x 'Live STT EMPTY' → batch).
  * Old code waited the full live timeout THEN fell to batch serially (~35s).
  * Now: 2.5s live grace, then batch starts in parallel — whichever returns real
  * text first wins. Fast live path unchanged; slow path recovers in batch time.
  *
- * v4.3.8: FIX "final response miss sometimes". (1) Non-speakable sentences
+ * v4.3.9: FIX "final response miss sometimes". (1) Non-speakable sentences
  * (e.g. a lone emoji "😄") are now skipped before TTS — they were POSTed to
  * Supertonic with an effectively-empty body, got HTTP 400, and the uncaught
  * error killed the tail sentence so text showed on screen but was never spoken.
  * (2) A TTS prefetch that fails (429/400) no longer silently drops that chunk;
  * the whole sentence falls back to speakText which re-fetches every chunk.
  *
- * v4.3.8: FIX live-STT results being thrown away. finish() timed out after
+ * v4.3.9: FIX live-STT results being thrown away. finish() timed out after
  * 3000ms while WhisperLiveKit on the VPS needs 6-30s to agree on final text
  * (ready_to_stop). The 3s timeout resolved with empty → wasted the good 161-char
  * transcript that arrived moments later at ready_to_stop → fell to the 21s
  * batch transcribe → garbled/short text went to the agent. finish() now waits
  * up to 20000ms for ready_to_stop (per-session override finishTimeoutMs).
  *
- * v4.3.8: FIX live-STT failure after the first utterance. Each utterance now
+ * v4.3.9: FIX live-STT failure after the first utterance. Each utterance now
  * gets its own WhisperLiveKit session (one WS + one ready_to_stop per utterance)
  * instead of a single shared session whose start() force-closed the previous
  * utterance's pending finish. This was causing "Live STT EMPTY → batch fallback"
@@ -497,7 +504,7 @@
       '<div class="va-toggle' + (CFG.truncateEnabled ? ' va-on' : '') + '" id="va-truncate-toggle"><div class="va-toggle-knob"></div></div></div>',
       '<div class="va-setting-row" id="va-truncate-row" style="display:' + (CFG.truncateEnabled ? 'flex' : 'none') + '"><div><label>Max chars</label></div>',
       '<input type="number" id="va-truncate-input" min="60" max="4000" step="10" value="' + CFG.truncateChars + '" style="width:90px;"></div>',
-      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v4.3.8 · Per-utterance live STT · Streaming TTS · Barge-in</div>',
+      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v4.3.9 · Per-utterance live STT · Streaming TTS · Barge-in</div>',
     ].join('');
   }
 
@@ -893,7 +900,11 @@
       }
 
       es.addEventListener('token', function (e) {
-        if (!STATE.expectingReply || !streamId) return;
+        if (!streamId) return;
+        // Don't block on expectingReply — a steer response's tokens may arrive
+        // after expectingReply was cleared by barge-in. The done handler will
+        // re-arm it. Blocking here means the steer response text never gets
+        // queued for TTS ("steer delivered but never appended / gets lost").
         try {
           var tokenData = JSON.parse(e.data);
           var delta = String((tokenData && tokenData.text) || '');
@@ -925,9 +936,23 @@
 
           STATE.responseText = text;
 
-          if (STATE.expectingReply) {
+          // Always deliver if there's text and a valid stream — even if
+          // expectingReply was cleared (e.g. by a barge-in that then became
+          // a new turn, or by the watchdog). Previously, a done event that
+          // arrived after expectingReply=false was silently ignored, so the
+          // completed response was never spoken ("steer lost / next message
+          // does not speak"). Re-arm expectingReply so finalizeStreamingResponse
+          // can run TTS, then let the coordinator deliver it.
+          if (text && streamId) {
+            if (!STATE.expectingReply) {
+              vaDbg('SSE', 'done arrived after expectingReply cleared — re-arming for delivery');
+              STATE.expectingReply = true;
+            }
             var accepted = TURN.noteDone(text, streamId);
             vaDbg('TURN', 'noteDone returned: ' + accepted + ' snap=' + JSON.stringify(TURN.snapshot()));
+          } else if (STATE.expectingReply) {
+            var accepted2 = TURN.noteDone('', streamId);
+            vaDbg('TURN', 'noteDone returned: ' + accepted2 + ' snap=' + JSON.stringify(TURN.snapshot()));
           }
         } catch (err) {
           console.warn('[VA ' + vaTs() + '] [SSE] done parse error, deferring empty completion:', err);
@@ -2281,7 +2306,7 @@
     hookSSE();
     checkCapabilities();
     testWasmEval();
-    vaDbg('BOOT', 'Voice Assistant v4.3.8 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
+    vaDbg('BOOT', 'Voice Assistant v4.3.9 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
       stt: CFG.streamingSttEnabled, tts: CFG.ttsEngine, voice: CFG.ttsVoice,
       crisp: CFG.crispPrompt, truncate: CFG.truncateEnabled, autoListen: CFG.autoListen,
     }));
