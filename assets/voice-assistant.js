@@ -1,5 +1,5 @@
 /**
- * Voice Assistant Extension v4.3.5 for Hermes WebUI
+ * Voice Assistant Extension v4.3.6 for Hermes WebUI
  *
  * Battle-tested stack:
  *  - Silero VAD (@ricky0123/vad-web v0.0.24) from CDN — neural network voice
@@ -11,34 +11,38 @@
  *    tied to the active stream; VAD paused during speech output to prevent
  *    self-triggering feedback.
  *
- * v4.3.5: FIX spurious/slow turns: only server-CONFIRMED live STT text may win
- * the race. v4.3.5's race trusted a 20s-timeout partial from WLK's
+ * v4.3.6: STT mode selector in settings panel (hybrid / live / batch) +
+ * configurable race-grace window. Panel widened to 360px and grouped into
+ * Conversation / Transcription / Speech synthesis sections.
+ *
+ * v4.3.6: FIX spurious/slow turns: only server-CONFIRMED live STT text may win
+ * the race. v4.3.6's race trusted a 20s-timeout partial from WLK's
  * localagreement (measured: "and load will out." sent to agent, correct batch
  * text arrived 15-45s later and was discarded). LiveSttSession now flags
  * confirmedViaReadyStop; unconfirmed timeouts defer to authoritative batch.
  *
- * v4.3.5: RACE live STT vs batch transcription. WLK runs
+ * v4.3.6: RACE live STT vs batch transcription. WLK runs
  * --backend-policy localagreement which takes 20-30s to settle on this 2-vCPU
  * box (measured: ready_to_stop +18s/+27s/+32s, 3x 'Live STT EMPTY' → batch).
  * Old code waited the full live timeout THEN fell to batch serially (~35s).
  * Now: 2.5s live grace, then batch starts in parallel — whichever returns real
  * text first wins. Fast live path unchanged; slow path recovers in batch time.
  *
- * v4.3.5: FIX "final response miss sometimes". (1) Non-speakable sentences
+ * v4.3.6: FIX "final response miss sometimes". (1) Non-speakable sentences
  * (e.g. a lone emoji "😄") are now skipped before TTS — they were POSTed to
  * Supertonic with an effectively-empty body, got HTTP 400, and the uncaught
  * error killed the tail sentence so text showed on screen but was never spoken.
  * (2) A TTS prefetch that fails (429/400) no longer silently drops that chunk;
  * the whole sentence falls back to speakText which re-fetches every chunk.
  *
- * v4.3.5: FIX live-STT results being thrown away. finish() timed out after
+ * v4.3.6: FIX live-STT results being thrown away. finish() timed out after
  * 3000ms while WhisperLiveKit on the VPS needs 6-30s to agree on final text
  * (ready_to_stop). The 3s timeout resolved with empty → wasted the good 161-char
  * transcript that arrived moments later at ready_to_stop → fell to the 21s
  * batch transcribe → garbled/short text went to the agent. finish() now waits
  * up to 20000ms for ready_to_stop (per-session override finishTimeoutMs).
  *
- * v4.3.5: FIX live-STT failure after the first utterance. Each utterance now
+ * v4.3.6: FIX live-STT failure after the first utterance. Each utterance now
  * gets its own WhisperLiveKit session (one WS + one ready_to_stop per utterance)
  * instead of a single shared session whose start() force-closed the previous
  * utterance's pending finish. This was causing "Live STT EMPTY → batch fallback"
@@ -96,6 +100,17 @@
     streamingSttEnabled: true,
     streamingSttHost: 'notdefined.tail8da646.ts.net',
     streamingSttPort: 7790,
+    // STT mode:
+    //   hybrid (default) — run live WLK for ~2.5s; if it hasn't confirmed via
+    //     ready_to_stop, race batch. Server-confirmed live text wins; timeout
+    //     partials are never sent to the agent.
+    //   live — live WLK first; fall back to batch only if it confirms empty.
+    //   batch — skip live STT entirely; always use authoritative batch (most
+    //     accurate, slower, no partial transcript display).
+    sttMode: 'hybrid',
+    // Hybrid grace window: how long to let live STT prove itself before the
+    // batch transcription joins the race (ms).
+    raceGraceMs: 2500,
     streamingSttSecure: true,
     streamingSttLanguage: 'auto',
 
@@ -287,6 +302,8 @@
         negativeSpeechThreshold: CFG.negativeSpeechThreshold,
         autoListen: CFG.autoListen,
         ttsEnabled: CFG.ttsEnabled,
+        sttMode: CFG.sttMode,
+        raceGraceMs: CFG.raceGraceMs,
         ttsVoice: CFG.ttsVoice,
         ttsEngine: CFG.ttsEngine,
         elevenlabsVoice: CFG.elevenlabsVoice,
@@ -398,15 +415,27 @@
     if (sensVal > 10) sensVal = 10;
     return [
       '<h3>🎙️ Voice Assistant</h3>',
+      '<div class="va-section">Conversation</div>',
       '<div class="va-setting-row"><div><label>TTS Responses</label><div class="va-hint">Speak agent replies aloud</div></div>',
       '<div class="va-toggle' + (CFG.ttsEnabled ? ' va-on' : '') + '" id="va-tts-toggle"><div class="va-toggle-knob"></div></div></div>',
       '<div class="va-setting-row"><div><label>Auto-Listen</label><div class="va-hint">Re-arm after response</div></div>',
       '<div class="va-toggle' + (CFG.autoListen ? ' va-on' : '') + '" id="va-auto-toggle"><div class="va-toggle-knob"></div></div></div>',
+      '<div class="va-section">Transcription</div>',
       '<div class="va-setting-row"><div><label>Live transcription</label><div class="va-hint">Show partial words while speaking</div></div>',
       '<div class="va-toggle' + (CFG.streamingSttEnabled ? ' va-on' : '') + '" id="va-live-stt-toggle"><div class="va-toggle-knob"></div></div></div>',
+      '<div class="va-setting-row"><div><label>STT Engine</label><div class="va-hint" id="va-stt-engine-hint">How speech becomes text</div></div>',
+      '<select id="va-stt-engine-select">',
+        '<option value="hybrid"' + (CFG.sttMode === 'hybrid' ? ' selected' : '') + '>Hybrid (live ± batch)</option>',
+        '<option value="live"' + (CFG.sttMode === 'live' ? ' selected' : '') + '>Live streaming</option>',
+        '<option value="batch"' + (CFG.sttMode === 'batch' ? ' selected' : '') + '>Batch (accurate)</option>',
+      '</select></div>',
+      '<div class="va-setting-row" id="va-racegrace-row" style="display:' + (CFG.sttMode === 'hybrid' ? 'flex' : 'none') + '"><div><label>Race grace</label><div class="va-hint">Live STT prove-it window; batch joins after</div></div>',
+      '<div class="va-slider-row"><input type="range" min="500" max="8000" step="250" value="' + CFG.raceGraceMs + '" id="va-racegrace-slider">',
+      '<span class="va-slider-val" id="va-racegrace-val">' + CFG.raceGraceMs + 'ms</span></div></div>',
       '<div class="va-setting-row"><div><label>Sensitivity</label><div class="va-hint">← Less sensitive · More →</div></div>',
       '<div class="va-slider-row"><input type="range" min="1" max="10" value="' + sensVal + '" id="va-sens-slider">',
       '<span class="va-slider-val" id="va-sens-val">' + sensVal + '</span></div></div>',
+      '<div class="va-section">Speech synthesis</div>',
       '<div class="va-setting-row"><div><label>TTS Engine</label><div class="va-hint" id="va-engine-hint">Edge = free, no key</div></div>',
       '<select id="va-engine-select">',
         '<option value="edge"' + (CFG.ttsEngine === 'edge' ? ' selected' : '') + '>Edge (free)</option>',
@@ -451,7 +480,7 @@
       '<div class="va-toggle' + (CFG.truncateEnabled ? ' va-on' : '') + '" id="va-truncate-toggle"><div class="va-toggle-knob"></div></div></div>',
       '<div class="va-setting-row" id="va-truncate-row" style="display:' + (CFG.truncateEnabled ? 'flex' : 'none') + '"><div><label>Max chars</label></div>',
       '<input type="number" id="va-truncate-input" min="60" max="4000" step="10" value="' + CFG.truncateChars + '" style="width:90px;"></div>',
-      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v4.3.5 · Per-utterance live STT · Streaming TTS · Barge-in</div>',
+      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v4.3.6 · Per-utterance live STT · Streaming TTS · Barge-in</div>',
     ].join('');
   }
 
@@ -578,6 +607,19 @@
     });
   }
 
+  // Show/hide the hybrid-only race-grace row and update the STT engine hint
+  // when the STT Engine selector changes.
+  function refreshSttEngineOptions() {
+    var row = document.getElementById('va-racegrace-row');
+    if (row) row.style.display = CFG.sttMode === 'hybrid' ? 'flex' : 'none';
+    var hint = document.getElementById('va-stt-engine-hint');
+    if (hint) {
+      if (CFG.sttMode === 'hybrid') hint.textContent = 'Live STT ± batch race — fast + accurate';
+      else if (CFG.sttMode === 'live') hint.textContent = 'Live WhisperLiveKit only (fastest; needs WS up)';
+      else hint.textContent = 'Batch Whisper only — most accurate, no partials';
+    }
+  }
+
   function wireSupertonicControls() {
     var lang = document.getElementById('va-supertonic-lang-select');
     if (lang) lang.addEventListener('change', function () {
@@ -612,6 +654,27 @@
       liveToggle.classList.toggle('va-on', CFG.streamingSttEnabled);
       if (!CFG.streamingSttEnabled) closeLiveSttCapture();
       else if (STATE.audioStream) ensureLiveSttCapture();
+      saveSettings();
+    });
+
+    // STT Engine selector — hybrid / live / batch.
+    var sttEngine = document.getElementById('va-stt-engine-select');
+    if (sttEngine) sttEngine.addEventListener('change', function () {
+      CFG.sttMode = sttEngine.value;
+      refreshSttEngineOptions();
+      // In batch-only mode the live WS serve no purpose — tear it down so we
+      // don't pay a connection that can never win. Re-enabling hybrid/live
+      // recreates it lazily on next listen.
+      if (CFG.sttMode === 'batch') closeLiveSttCapture();
+      saveSettings();
+    });
+
+    // Race grace slider (hybrid mode only).
+    var raceGrace = document.getElementById('va-racegrace-slider');
+    if (raceGrace) raceGrace.addEventListener('input', function () {
+      CFG.raceGraceMs = parseInt(raceGrace.value, 10) || 2500;
+      var label = document.getElementById('va-racegrace-val');
+      if (label) label.textContent = CFG.raceGraceMs + 'ms';
       saveSettings();
     });
 
@@ -692,6 +755,7 @@
     // Attach handlers to the engine-specific voice control rendered at build.
     wireVoiceControl();
     wireSupertonicControls();
+    refreshSttEngineOptions();
   }
 
   // Generic range-slider binding: updates CFG[key], per-second label, saves,
@@ -980,7 +1044,8 @@
 
   function startLiveSttUtterance() {
     STATE.liveTranscript = '';
-    if (!CFG.streamingSttEnabled) return;
+    // Batch-only STT mode: no live streaming needed at all.
+    if (!CFG.streamingSttEnabled || CFG.sttMode === 'batch') return;
     ensureLiveSttCapture().then(function (ready) {
       if (!ready) return;
       // Always create a FRESH session for this utterance. The previous one keeps
@@ -1230,75 +1295,95 @@
     STT_QUEUE.add(function () {
       if (generation !== STATE.stopGeneration) return '';
 
-      // Race live STT against batch transcription. The WLK server on this box
-      // runs --backend-policy localagreement, which can take 20-30s to settle
-      // (measured). Waiting for it serially and THEN falling back to batch
-      // meant paying live-wait + batch-time back-to-back (~35s). Instead, give
-      // live STT a short grace window; if it hasn't returned text by then,
-      // kick off batch in parallel and take whichever resolves first.
-      if (sttDonePromise) {
-        var liveSettled = false;
-        var liveResult = null;
-        return new Promise(function (resolve, reject) {
-          var done = false;
-          function finish(text) {
-            if (done) return;
-            done = true;
-            resolve(text);
+      // STT mode routing.
+      //  - 'batch': live STT is skipped entirely; authoritative batch only.
+      //  - 'live' : live WLK first; batch fallback only if it confirms empty.
+      //  - 'hybrid' (default): grace window of raceGraceMs, then race live vs
+      //    batch. Server-confirmed live text wins; timeout partials never do.
+      if (CFG.sttMode === 'batch' || !sttDonePromise) {
+        vaDbg('STT', 'batch-only path' + (CFG.sttMode === 'batch' ? ' (mode=' + CFG.sttMode + ')' : '') + ' — ' + blob.size + ' bytes');
+        return window.withVoiceTimeout(function () { return batchTranscribe(blob); }, 45000);
+      }
+
+      if (CFG.sttMode === 'live') {
+        // Live-first: await WLK's finish. Use it only if the server truly
+        // confirmed ready_to_stop; otherwise authoritative batch.
+        return sttDonePromise.then(function (liveText) {
+          var clean = String(liveText || '').trim();
+          var confirmed = !!(sttDonePromise && sttDonePromise.liveSession && sttDonePromise.liveSession.confirmedViaReadyStop);
+          if (confirmed && clean.length >= 2) {
+            vaDbg('STT', 'Live STT (server-confirmed) in ' + Math.round(performance.now() - t0) + 'ms: "' + clean.slice(0, 60) + '"');
+            return clean;
           }
-
-          // Track live outcome; if it wins with REAL server-confirmed text,
-          // use it. A 20s-timeout partial is NOT reliable — WLK's
-          // localagreement often resolves mid-agreement with a fragment
-          // (measured: "and load will out." instead of the full query) that
-          // gets SENT to the agent as a spurious turn. Only ready_to_stop-
-          // confirmed text may win; otherwise authoritative batch decides.
-          sttDonePromise.then(function (liveText) {
-            liveSettled = true;
-            liveResult = String(liveText || '').trim();
-            var confirmed = !!(sttDonePromise && sttDonePromise.liveSession && sttDonePromise.liveSession.confirmedViaReadyStop);
-            if (confirmed && liveResult.length >= 2) {
-              vaDbg('STT', 'Live STT (server-confirmed) won race in ' + Math.round(performance.now() - t0) + 'ms: "' + liveResult.slice(0, 60) + '"');
-              finish(liveResult);
-            } else {
-              vaDbg('STT-WARN', 'Live STT ' + (confirmed ? 'empty' : 'NOT server-confirmed (timeout partial)') + ' in ' + Math.round(performance.now() - t0) + 'ms — batch decides');
-            }
-          }).catch(function (err) {
-            liveSettled = true;
-            vaDbg('STT-WARN', 'Live STT failed (' + Math.round(performance.now() - t0) + 'ms):', err ? String(err.message || err) : 'unknown');
-          });
-
-          // Grace window: only spin up batch if live STT hasn't already won.
-          // 2.5s is ample for WLK's fast path here; on the slow path the batch
-          // request then overlaps the remaining live wait and both race.
-          setTimeout(function () {
-            if (done) return;
-            window.withVoiceTimeout(function () { return batchTranscribe(blob); }, 45000)
-              .then(function (batchText) {
-                var clean = String(batchText || '').trim();
-                if (clean.length >= 2) {
-                  vaDbg('STT', 'Batch won race in ' + Math.round(performance.now() - t0) + 'ms: "' + clean.slice(0, 60) + '"' +
-                    (liveSettled ? ' (live was ' + (liveResult ? '"' + liveResult.slice(0, 40) + '"' : 'empty') + ')' : ' (live still pending)'));
-                  finish(clean);
-                } else {
-                  vaDbg('STT-WARN', 'Batch returned empty');
-                  // If live is still pending, it may still produce text; if it
-                  // already settled empty, resolve empty to unblock the queue.
-                  if (liveSettled) finish('');
-                }
-              })
-              .catch(function (err) {
-                vaDbg('STT-WARN', 'Batch failed:', err ? String(err.message || err) : 'unknown');
-                // Live still pending → let it decide; else unblock with empty.
-                setTimeout(function () { if (!done) finish(liveSettled ? '' : null); }, 0);
-              });
-          }, 2500);
-        }).catch(function () {
+          vaDbg('STT-WARN', 'Live STT ' + (confirmed ? 'empty' : 'NOT server-confirmed') + ' in ' + Math.round(performance.now() - t0) + 'ms → batch');
+          return window.withVoiceTimeout(function () { return batchTranscribe(blob); }, 45000);
+        }).catch(function (err) {
+          vaDbg('STT-WARN', 'Live STT failed (' + Math.round(performance.now() - t0) + 'ms):', err ? String(err.message || err) : 'unknown');
           return window.withVoiceTimeout(function () { return batchTranscribe(blob); }, 45000);
         });
       }
 
-      return window.withVoiceTimeout(function () { return batchTranscribe(blob); }, 45000);
+      // hybrid: race live STT against batch.
+      var liveSettled = false;
+      var liveResult = null;
+      var grace = (Number(CFG.raceGraceMs) > 0) ? Number(CFG.raceGraceMs) : 2500;
+      return new Promise(function (resolve, reject) {
+        var done = false;
+        function finish(text) {
+          if (done) return;
+          done = true;
+          resolve(text);
+        }
+
+        // Track live outcome; if it wins with REAL server-confirmed text,
+        // use it. A 20s-timeout partial is NOT reliable — WLK's
+        // localagreement often resolves mid-agreement with a fragment
+        // (measured: "and load will out." instead of the full query) that
+        // gets SENT to the agent as a spurious turn. Only ready_to_stop-
+        // confirmed text may win; otherwise authoritative batch decides.
+        sttDonePromise.then(function (liveText) {
+          liveSettled = true;
+          liveResult = String(liveText || '').trim();
+          var confirmed = !!(sttDonePromise && sttDonePromise.liveSession && sttDonePromise.liveSession.confirmedViaReadyStop);
+          if (confirmed && liveResult.length >= 2) {
+            vaDbg('STT', 'Live STT (server-confirmed) won race in ' + Math.round(performance.now() - t0) + 'ms: "' + liveResult.slice(0, 60) + '"');
+            finish(liveResult);
+          } else {
+            vaDbg('STT-WARN', 'Live STT ' + (confirmed ? 'empty' : 'NOT server-confirmed (timeout partial)') + ' in ' + Math.round(performance.now() - t0) + 'ms — batch decides');
+          }
+        }).catch(function (err) {
+          liveSettled = true;
+          vaDbg('STT-WARN', 'Live STT failed (' + Math.round(performance.now() - t0) + 'ms):', err ? String(err.message || err) : 'unknown');
+        });
+
+        // Grace window: only spin up batch if live STT hasn't already won.
+        // On WLK's slow path the batch request overlaps the remaining live
+        // wait and both race; whichever returns real text first wins.
+        setTimeout(function () {
+          if (done) return;
+          window.withVoiceTimeout(function () { return batchTranscribe(blob); }, 45000)
+            .then(function (batchText) {
+              var clean = String(batchText || '').trim();
+              if (clean.length >= 2) {
+                vaDbg('STT', 'Batch won race in ' + Math.round(performance.now() - t0) + 'ms: "' + clean.slice(0, 60) + '"' +
+                  (liveSettled ? ' (live was ' + (liveResult ? '"' + liveResult.slice(0, 40) + '"' : 'empty') + ')' : ' (live still pending)'));
+                finish(clean);
+              } else {
+                vaDbg('STT-WARN', 'Batch returned empty');
+                // If live is still pending, it may still produce text; if it
+                // already settled empty, resolve empty to unblock the queue.
+                if (liveSettled) finish('');
+              }
+            })
+            .catch(function (err) {
+              vaDbg('STT-WARN', 'Batch failed:', err ? String(err.message || err) : 'unknown');
+              // Live still pending → let it decide; else unblock with empty.
+              setTimeout(function () { if (!done) finish(liveSettled ? '' : null); }, 0);
+            });
+        }, grace);
+      }).catch(function () {
+        return window.withVoiceTimeout(function () { return batchTranscribe(blob); }, 45000);
+      });
     }).then(function (text) {
       TURN.endStt();
       if (generation !== STATE.stopGeneration) return;
@@ -2096,7 +2181,7 @@
       if (!vad) { setPhase('idle'); return; }
     }
 
-    if (CFG.streamingSttEnabled) await ensureLiveSttCapture();
+    if (CFG.streamingSttEnabled && CFG.sttMode !== 'batch') await ensureLiveSttCapture();
 
     STATE.responseDone = false;
     STATE.responseText = '';
@@ -2145,7 +2230,7 @@
     hookSSE();
     checkCapabilities();
     testWasmEval();
-    vaDbg('BOOT', 'Voice Assistant v4.3.5 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
+    vaDbg('BOOT', 'Voice Assistant v4.3.6 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
       stt: CFG.streamingSttEnabled, tts: CFG.ttsEngine, voice: CFG.ttsVoice,
       crisp: CFG.crispPrompt, truncate: CFG.truncateEnabled, autoListen: CFG.autoListen,
     }));

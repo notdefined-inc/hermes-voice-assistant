@@ -134,8 +134,8 @@
   position: fixed;
   bottom: 80px;
   right: 92px;
-  width: 300px;
-  max-height: 620px;
+  width: 360px;
+  max-height: 72vh;
   overflow-y: auto;
   border-radius: 16px;
   z-index: 100000;
@@ -165,6 +165,19 @@
   font-size: 15px;
   font-weight: 700;
 }
+
+/* Category section headers inside the settings panel */
+.va-section {
+  margin: 14px 0 6px 0;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  opacity: 0.55;
+  border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+  padding-bottom: 4px;
+}
+.va-section:first-child { margin-top: 2px; }
 
 .va-setting-row {
   display: flex;
