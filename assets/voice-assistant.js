@@ -1,5 +1,5 @@
 /**
- * Voice Assistant Extension v4.3.4 for Hermes WebUI
+ * Voice Assistant Extension v4.3.5 for Hermes WebUI
  *
  * Battle-tested stack:
  *  - Silero VAD (@ricky0123/vad-web v0.0.24) from CDN — neural network voice
@@ -11,28 +11,34 @@
  *    tied to the active stream; VAD paused during speech output to prevent
  *    self-triggering feedback.
  *
- * v4.3.4: RACE live STT vs batch transcription. WLK runs
+ * v4.3.5: FIX spurious/slow turns: only server-CONFIRMED live STT text may win
+ * the race. v4.3.5's race trusted a 20s-timeout partial from WLK's
+ * localagreement (measured: "and load will out." sent to agent, correct batch
+ * text arrived 15-45s later and was discarded). LiveSttSession now flags
+ * confirmedViaReadyStop; unconfirmed timeouts defer to authoritative batch.
+ *
+ * v4.3.5: RACE live STT vs batch transcription. WLK runs
  * --backend-policy localagreement which takes 20-30s to settle on this 2-vCPU
  * box (measured: ready_to_stop +18s/+27s/+32s, 3x 'Live STT EMPTY' → batch).
  * Old code waited the full live timeout THEN fell to batch serially (~35s).
  * Now: 2.5s live grace, then batch starts in parallel — whichever returns real
  * text first wins. Fast live path unchanged; slow path recovers in batch time.
  *
- * v4.3.4: FIX "final response miss sometimes". (1) Non-speakable sentences
+ * v4.3.5: FIX "final response miss sometimes". (1) Non-speakable sentences
  * (e.g. a lone emoji "😄") are now skipped before TTS — they were POSTed to
  * Supertonic with an effectively-empty body, got HTTP 400, and the uncaught
  * error killed the tail sentence so text showed on screen but was never spoken.
  * (2) A TTS prefetch that fails (429/400) no longer silently drops that chunk;
  * the whole sentence falls back to speakText which re-fetches every chunk.
  *
- * v4.3.4: FIX live-STT results being thrown away. finish() timed out after
+ * v4.3.5: FIX live-STT results being thrown away. finish() timed out after
  * 3000ms while WhisperLiveKit on the VPS needs 6-30s to agree on final text
  * (ready_to_stop). The 3s timeout resolved with empty → wasted the good 161-char
  * transcript that arrived moments later at ready_to_stop → fell to the 21s
  * batch transcribe → garbled/short text went to the agent. finish() now waits
  * up to 20000ms for ready_to_stop (per-session override finishTimeoutMs).
  *
- * v4.3.4: FIX live-STT failure after the first utterance. Each utterance now
+ * v4.3.5: FIX live-STT failure after the first utterance. Each utterance now
  * gets its own WhisperLiveKit session (one WS + one ready_to_stop per utterance)
  * instead of a single shared session whose start() force-closed the previous
  * utterance's pending finish. This was causing "Live STT EMPTY → batch fallback"
@@ -445,7 +451,7 @@
       '<div class="va-toggle' + (CFG.truncateEnabled ? ' va-on' : '') + '" id="va-truncate-toggle"><div class="va-toggle-knob"></div></div></div>',
       '<div class="va-setting-row" id="va-truncate-row" style="display:' + (CFG.truncateEnabled ? 'flex' : 'none') + '"><div><label>Max chars</label></div>',
       '<input type="number" id="va-truncate-input" min="60" max="4000" step="10" value="' + CFG.truncateChars + '" style="width:90px;"></div>',
-      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v4.3.4 · Per-utterance live STT · Streaming TTS · Barge-in</div>',
+      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v4.3.5 · Per-utterance live STT · Streaming TTS · Barge-in</div>',
     ].join('');
   }
 
@@ -1001,7 +1007,15 @@
   }
 
   function finishLiveSttUtterance() {
-    if (STATE.liveStt) return STATE.liveStt.finish();
+    // Attach a reference to the LiveSttSession so the race in finishWithAudio
+    // can distinguish a server-CONFIRMED transcript (ready_to_stop received)
+    // from a 20s-timeout partial. Only confirmed live text may win the race;
+    // otherwise the authoritative batch result decides.
+    if (STATE.liveStt) {
+      var p = STATE.liveStt.finish();
+      try { p.liveSession = STATE.liveStt; } catch (_) {}
+      return p;
+    }
     return Promise.resolve('');
   }
 
@@ -1233,15 +1247,21 @@
             resolve(text);
           }
 
-          // Track live outcome; if it wins with real text, use it.
+          // Track live outcome; if it wins with REAL server-confirmed text,
+          // use it. A 20s-timeout partial is NOT reliable — WLK's
+          // localagreement often resolves mid-agreement with a fragment
+          // (measured: "and load will out." instead of the full query) that
+          // gets SENT to the agent as a spurious turn. Only ready_to_stop-
+          // confirmed text may win; otherwise authoritative batch decides.
           sttDonePromise.then(function (liveText) {
             liveSettled = true;
             liveResult = String(liveText || '').trim();
-            if (liveResult.length >= 2) {
-              vaDbg('STT', 'Live STT won race in ' + Math.round(performance.now() - t0) + 'ms: "' + liveResult.slice(0, 60) + '"');
+            var confirmed = !!(sttDonePromise && sttDonePromise.liveSession && sttDonePromise.liveSession.confirmedViaReadyStop);
+            if (confirmed && liveResult.length >= 2) {
+              vaDbg('STT', 'Live STT (server-confirmed) won race in ' + Math.round(performance.now() - t0) + 'ms: "' + liveResult.slice(0, 60) + '"');
               finish(liveResult);
             } else {
-              vaDbg('STT-WARN', 'Live STT settled empty (' + Math.round(performance.now() - t0) + 'ms) — batch continues');
+              vaDbg('STT-WARN', 'Live STT ' + (confirmed ? 'empty' : 'NOT server-confirmed (timeout partial)') + ' in ' + Math.round(performance.now() - t0) + 'ms — batch decides');
             }
           }).catch(function (err) {
             liveSettled = true;
@@ -2125,7 +2145,7 @@
     hookSSE();
     checkCapabilities();
     testWasmEval();
-    vaDbg('BOOT', 'Voice Assistant v4.3.4 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
+    vaDbg('BOOT', 'Voice Assistant v4.3.5 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
       stt: CFG.streamingSttEnabled, tts: CFG.ttsEngine, voice: CFG.ttsVoice,
       crisp: CFG.crispPrompt, truncate: CFG.truncateEnabled, autoListen: CFG.autoListen,
     }));

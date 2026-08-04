@@ -148,6 +148,7 @@
     this.finishing = false;
     this.pending = [];
     this.lastTranscript = '';
+    this.confirmedViaReadyStop = false;
   }
 
   LiveSttSession.prototype.pushPcm = function (value) {
@@ -170,6 +171,7 @@
     this.active = true;
     this.finishing = false;
     this.lastTranscript = '';
+    this.confirmedViaReadyStop = false;
     this._finishResolve = null;
     this._finishTimeout = null;
     dbg('WS', 'start: new utterance, url=' + String(this.url).replace(/\?.*$/, ''));
@@ -201,6 +203,11 @@
           if (finalText && finalText.length > self.lastTranscript.length) {
             self.lastTranscript = finalText;
           }
+          // Server has CONFIRMED the utterance is fully flushed. This flag is
+          // what lets the caller distinguish a real final transcript from a
+          // 20s-timeout partial (which WLK's localagreement often resolves
+          // mid-agreement with a fragment like "and load will out.").
+          self.confirmedViaReadyStop = true;
           if (self._finishResolve) {
             var resolve = self._finishResolve;
             self._finishResolve = null;
