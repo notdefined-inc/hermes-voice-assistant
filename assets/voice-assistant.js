@@ -693,9 +693,10 @@
     if (row) row.style.display = CFG.sttMode === 'hybrid' ? 'flex' : 'none';
     var hint = document.getElementById('va-stt-engine-hint');
     if (hint) {
-      if (CFG.sttMode === 'hybrid') hint.textContent = 'Live STT ± batch race — fast + accurate';
-      else if (CFG.sttMode === 'live') hint.textContent = 'Live WhisperLiveKit only (fastest; needs WS up)';
-      else hint.textContent = 'Batch Whisper only — most accurate, no partials';
+      var liveLabel = CFG.sttProvider === 'elevenlabs' ? 'ElevenLabs Realtime' : 'WhisperLiveKit';
+      if (CFG.sttMode === 'hybrid') hint.textContent = liveLabel + ' ± batch race — fast + accurate';
+      else if (CFG.sttMode === 'live') hint.textContent = liveLabel + ' only (fastest)';
+      else hint.textContent = 'Batch only — most accurate, no partials';
     }
   }
 
@@ -765,6 +766,7 @@
       if (hint) {
         if (CFG.sttProvider === 'auto') hint.textContent = 'Server picks: config stt.provider, else local > cloud';
         else if (CFG.sttProvider === 'local') hint.textContent = 'faster-whisper on this machine — free, offline';
+        else if (CFG.sttProvider === 'elevenlabs') hint.textContent = 'Live mode → Realtime WebSocket · batch → Scribe';
         else hint.textContent = 'Requires the matching API key on the server';
       }
       saveSettings();
@@ -1241,6 +1243,30 @@
   }
 
   function makeLiveSttSession() {
+    // ElevenLabs provider → its Realtime WebSocket (scribe_v2_realtime) with
+    // partial + committed transcripts. Anything else (auto/local) → WLK.
+    if (CFG.sttProvider === 'elevenlabs' && window.ElevenLabsLiveSession) {
+      var elLang = CFG.streamingSttLanguage === 'auto' ? '' : CFG.streamingSttLanguage;
+      return new window.ElevenLabsLiveSession({
+        tokenUrl: '/api/stt/elevenlabs-token',
+        language: elLang,
+        preRollBytes: Math.max(16000, Math.round(16000 * 2 * CFG.preRollMs / 1000)),
+        onTranscript: function (text) {
+          STATE.liveTranscript = text;
+          if (statusLabel && (STATE.phase === 'listening' || STATE.phase === 'transcribing')) {
+            statusLabel.textContent = liveTranscriptStatus(STATE.phase === 'transcribing' ? 'Finalizing' : 'Listening');
+            statusLabel.classList.add('va-visible');
+          }
+        },
+        onError: function (err) {
+          console.warn('[VA ' + vaTs() + '] [STT] ElevenLabs live STT unavailable; final batch STT remains active:', err);
+          if (!STATE.liveSttErrorShown) {
+            STATE.liveSttErrorShown = true;
+            showToast('Voice: ElevenLabs live transcript unavailable — batch Scribe still works', 4000);
+          }
+        },
+      });
+    }
     return new window.LiveSttSession({
       url: liveSttUrl(),
       preRollBytes: Math.max(16000, Math.round(16000 * 2 * CFG.preRollMs / 1000)),

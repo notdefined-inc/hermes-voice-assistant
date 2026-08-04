@@ -1,13 +1,14 @@
 {
   "id": "voice-assistant",
   "name": "Voice Assistant",
-  "version": "5.1.0",
+  "version": "5.2.0",
   "description": "Live partial STT, sentence-streaming TTS, guarded final STT, steering, and barge-in",
   "assets": {
     "scripts": [
       "assets/voice-turn-coordinator.js",
       "assets/streaming-voice-pipeline.js",
       "assets/live-stt-client.js",
+      "assets/elevenlabs-live-stt-client.js",
       "assets/voice-assistant.js"
     ],
     "stylesheets": [
