@@ -1,5 +1,5 @@
 /**
- * Voice Assistant Extension v4.3.2 for Hermes WebUI
+ * Voice Assistant Extension v4.3.3 for Hermes WebUI
  *
  * Battle-tested stack:
  *  - Silero VAD (@ricky0123/vad-web v0.0.24) from CDN — neural network voice
@@ -11,14 +11,21 @@
  *    tied to the active stream; VAD paused during speech output to prevent
  *    self-triggering feedback.
  *
- * v4.3.2: FIX live-STT results being thrown away. finish() timed out after
+ * v4.3.3: FIX "final response miss sometimes". (1) Non-speakable sentences
+ * (e.g. a lone emoji "😄") are now skipped before TTS — they were POSTed to
+ * Supertonic with an effectively-empty body, got HTTP 400, and the uncaught
+ * error killed the tail sentence so text showed on screen but was never spoken.
+ * (2) A TTS prefetch that fails (429/400) no longer silently drops that chunk;
+ * the whole sentence falls back to speakText which re-fetches every chunk.
+ *
+ * v4.3.3: FIX live-STT results being thrown away. finish() timed out after
  * 3000ms while WhisperLiveKit on the VPS needs 6-30s to agree on final text
  * (ready_to_stop). The 3s timeout resolved with empty → wasted the good 161-char
  * transcript that arrived moments later at ready_to_stop → fell to the 21s
  * batch transcribe → garbled/short text went to the agent. finish() now waits
  * up to 20000ms for ready_to_stop (per-session override finishTimeoutMs).
  *
- * v4.3.2: FIX live-STT failure after the first utterance. Each utterance now
+ * v4.3.3: FIX live-STT failure after the first utterance. Each utterance now
  * gets its own WhisperLiveKit session (one WS + one ready_to_stop per utterance)
  * instead of a single shared session whose start() force-closed the previous
  * utterance's pending finish. This was causing "Live STT EMPTY → batch fallback"
@@ -431,7 +438,7 @@
       '<div class="va-toggle' + (CFG.truncateEnabled ? ' va-on' : '') + '" id="va-truncate-toggle"><div class="va-toggle-knob"></div></div></div>',
       '<div class="va-setting-row" id="va-truncate-row" style="display:' + (CFG.truncateEnabled ? 'flex' : 'none') + '"><div><label>Max chars</label></div>',
       '<input type="number" id="va-truncate-input" min="60" max="4000" step="10" value="' + CFG.truncateChars + '" style="width:90px;"></div>',
-      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v4.3.2 · Per-utterance live STT · Streaming TTS · Barge-in</div>',
+      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v4.3.3 · Per-utterance live STT · Streaming TTS · Barge-in</div>',
     ].join('');
   }
 
@@ -1470,6 +1477,15 @@
   function queueStreamingSentence(sentence) {
     sentence = String(sentence || '').trim();
     if (!sentence) return;
+    // Strip markdown/emoji and check what is actually left to speak. A sentence
+    // that reduces to nothing (e.g. a lone emoji like "😄") must NOT be sent to
+    // TTS — Supertonic/Edge reject it with HTTP 400 and the uncaught error
+    // kills the final spoken sentence ("final response miss sometimes").
+    var speakable = crispify(sentence);
+    if (!String(speakable || '').trim()) {
+      vaDbg('TTS-SKIP', 'non-speakable sentence (empty after clean): "' + sentence.slice(0, 40) + '"');
+      return;
+    }
     vaDbg('TTS', 'queueStreamingSentence: "' + sentence.slice(0, 60) + '" ttsEnabled=' + CFG.ttsEnabled +
       ' streamDelay=' + (STREAM_SPEECH.streamCreatedAt ? (Date.now() - STREAM_SPEECH.streamCreatedAt) + 'ms' : '-'));
     if (!CFG.ttsEnabled) return;
@@ -1534,13 +1550,25 @@
       (function (chunk) {
         result = result.then(function (acc) {
           return serializedTtsFetch(chunk, token, streamId).then(function (item) {
-            if (item) acc.push(item);
+            if (!item) {
+              // A chunk failed to prefetch (429/400/network). Abort the whole
+              // prefetch so playPrefetchedSentence falls back to speakText,
+              // which re-fetches EVERY chunk and never silently drops a
+              // sentence. Dropping one chunk here = text visible on screen but
+              // a spoken sentence missing ("final response miss sometimes").
+              acc.failed = true;
+              return acc;
+            }
+            acc.push(item);
             return acc;
           });
         });
       })(chunks[i]);
     }
-    return result;
+    return result.then(function (acc) {
+      if (acc.failed) return null; // fall back to speakText (full robust fetch)
+      return acc;
+    });
   }
 
   function playPrefetchedSentence(sentence, token, prefetched) {
@@ -1813,6 +1841,12 @@
     var prose = crispify(text);
     var sentences = splitIntoSentences(prose);
     var chunks = chunkSentences(sentences, CFG.ttsChunkSize);
+    // Nothing speakable after cleaning (e.g. only markdown/emoji) — skip TTS
+    // entirely rather than POSTing an empty body and getting 400.
+    if (!chunks.length || !String(chunks[0] || '').trim()) {
+      STATE.ttsActive = false;
+      return;
+    }
     STATE.ttsActive = true;
 
     // Keep neural VAD armed during TTS. Browser echo cancellation suppresses
@@ -2040,7 +2074,7 @@
     hookSSE();
     checkCapabilities();
     testWasmEval();
-    vaDbg('BOOT', 'Voice Assistant v4.3.2 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
+    vaDbg('BOOT', 'Voice Assistant v4.3.3 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
       stt: CFG.streamingSttEnabled, tts: CFG.ttsEngine, voice: CFG.ttsVoice,
       crisp: CFG.crispPrompt, truncate: CFG.truncateEnabled, autoListen: CFG.autoListen,
     }));
