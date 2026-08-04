@@ -1,0 +1,247 @@
+diff --git a/api/routes.py b/api/routes.py
+index a4c7f8df..254b1f7a 100644
+--- a/api/routes.py
++++ b/api/routes.py
+@@ -275,7 +275,7 @@ _CLIENT_EVENT_RATE_LIMIT_LOCK = threading.Lock()
+ _CLIENT_EVENT_RATE_LIMIT_WINDOW_SECONDS = 60
+ _CLIENT_EVENT_RATE_LIMIT_MAX = 30
+ _CLIENT_EVENT_MAX_BODY_BYTES = 4 * 1024
+-_EXTENSION_SIDECAR_PROXY_MAX_RESPONSE_BYTES = 512 * 1024
++_EXTENSION_SIDECAR_PROXY_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+ _CLIENT_EVENT_ALLOWED_FIELDS = {
+     "event": 64,
+     "source": 80,
+@@ -5559,7 +5559,7 @@ def _handle_extension_sidecar_proxy(
+             method=method,
+         )
+         opener = _extension_sidecar_proxy_same_origin_opener(target["origin"])
+-        with opener.open(request, timeout=10) as response:
++        with opener.open(request, timeout=120) as response:
+             body = _read_extension_sidecar_proxy_body(response)
+             return _send_extension_sidecar_proxy_response(
+                 handler,
+@@ -13693,9 +13693,6 @@ def handle_post(handler, parsed) -> bool:
+     if parsed.path == "/api/tts":
+         return _handle_tts(handler, parsed)
+ 
+-    if parsed.path == "/api/stt/elevenlabs-token":
+-        return _handle_stt_elevenlabs_token(handler, parsed)
+-
+     if parsed.path == "/api/client-events/log":
+         if diag:
+             diag.stage("read_client_event_body")
+@@ -18161,80 +18158,6 @@ def _handle_tts(handler, parsed):
+         from api.helpers import bad as _bad
+         return _bad(handler, "rate limit exceeded — please wait", 429)
+ 
+-    # ── Supertonic local server TTS ─────────────────────────────────────
+-    # The ONNX model stays resident in a loopback-only sidecar. Browsers receive
+-    # only the generated WAV, avoiding the ~400 MB model transfer and mobile
+-    # WebGPU/WASM memory pressure of the optional client-side engine.
+-    if engine == "supertonic-server":
+-        req_voice = (data.get("voice") or "F1").strip().upper()
+-        lang = (data.get("lang") or "na").strip().lower()
+-        allowed_voices = {f"{gender}{idx}" for gender in ("M", "F") for idx in range(1, 6)}
+-        allowed_langs = {
+-            "ar", "bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr",
+-            "de", "el", "hi", "hu", "id", "it", "ja", "ko", "lv", "lt",
+-            "pl", "pt", "ro", "ru", "sk", "sl", "es", "sv", "tr", "uk",
+-            "vi", "na",
+-        }
+-        try:
+-            steps = int(data.get("steps", 5))
+-            speed = float(data.get("speed", 1.05))
+-        except (TypeError, ValueError):
+-            from api.helpers import bad as _bad
+-            return _bad(handler, "invalid Supertonic steps or speed", 400)
+-        if req_voice not in allowed_voices:
+-            from api.helpers import bad as _bad
+-            return _bad(handler, "invalid Supertonic voice", 400)
+-        if lang not in allowed_langs:
+-            from api.helpers import bad as _bad
+-            return _bad(handler, "invalid Supertonic language", 400)
+-        if steps < 1 or steps > 12 or speed < 0.7 or speed > 2.0:
+-            from api.helpers import bad as _bad
+-            return _bad(handler, "Supertonic steps or speed out of range", 400)
+-
+-        url = "http://127.0.0.1:7788/v1/tts"
+-        req_body = json.dumps({
+-            "text": text,
+-            "voice": req_voice,
+-            "lang": lang,
+-            "steps": steps,
+-            "speed": speed,
+-            "response_format": "wav",
+-        }).encode("utf-8")
+-        req = Request(url, data=req_body, headers={
+-            "Content-Type": "application/json",
+-            "Accept": "audio/wav",
+-        })
+-        try:
+-            # No proxy and no redirects: this request must stay on loopback.
+-            with _tts_open(
+-                req,
+-                timeout=120,
+-                opener_factory=lambda: build_opener(ProxyHandler({}), _NoRedirectTtsHandler()),
+-            ) as resp:
+-                audio_data = _buffer_tts_audio_response(resp)
+-        except ValueError:
+-            logger.warning("Supertonic returned an invalid audio response", exc_info=True)
+-            from api.helpers import bad as _bad
+-            return _bad(handler, "Supertonic returned invalid audio", 502)
+-        except Exception:
+-            logger.exception("Supertonic local server generation failed")
+-            from api.helpers import bad as _bad
+-            return _bad(handler, "Supertonic local server unavailable", 503)
+-
+-        if not audio_data:
+-            from api.helpers import bad as _bad
+-            return _bad(handler, "Supertonic produced no audio", 500)
+-        handler.send_response(200)
+-        handler.send_header("Content-Type", "audio/wav")
+-        handler.send_header("Cache-Control", "no-store")
+-        handler.send_header("Content-Length", str(len(audio_data)))
+-        handler.end_headers()
+-        try:
+-            handler.wfile.write(audio_data)
+-        except (BrokenPipeError, ConnectionResetError):
+-            pass
+-        return True
+-
+     # ── ElevenLabs TTS ──────────────────────────────────────────────────
+     if engine == "elevenlabs":
+         api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+@@ -18465,98 +18388,6 @@ def _handle_tts(handler, parsed):
+         return _bad(handler, "TTS generation failed", 500)
+ 
+ 
+-def _handle_stt_elevenlabs_token(handler, parsed):
+-    """Mint a single-use ElevenLabs Realtime STT token for the voice assistant.
+-
+-    The ElevenLabs Realtime STT WebSocket accepts a short-lived single-use
+-    token (``POST /v1/single-use-token/realtime_scribe``) so the browser can
+-    stream microphone audio directly to api.elevenlabs.io without ever seeing
+-    the account API key. Tokens expire after 15 minutes and are consumed on
+-    use.
+-
+-    POST /api/stt/elevenlabs-token  →  {"ok": true, "token": "sutkn_..."}
+-    """
+-    if handler.command != "POST":
+-        from api.helpers import bad as _bad
+-        return _bad(handler, "POST required for /api/stt/elevenlabs-token", 405)
+-
+-    from api.auth import is_auth_enabled, parse_cookie, verify_session
+-    if is_auth_enabled():
+-        cv = parse_cookie(handler)
+-        if not (cv and verify_session(cv)):
+-            from api.helpers import bad as _bad
+-            return _bad(handler, "unauthorized", 401)
+-
+-    # Per-client rate limiting (tokens mint against the paid ElevenLabs API,
+-    # but minting itself is free — so we allow a small burst: up to 3 tokens
+-    # per 5 s window. Speech bursts (rapid follow-up utterances, barge-in)
+-    # routinely mint one token per utterance, sometimes <5 s apart.)
+-    if not hasattr(_handle_stt_elevenlabs_token, "_limiter"):
+-        import time as _time, threading as _threading
+-
+-        class _TokenLimiter:
+-            def __init__(self, max_burst=3, window_seconds=5.0, prune_interval=25):
+-                self.max_burst = max_burst
+-                self.window = window_seconds
+-                self.prune_interval = prune_interval
+-                self._hits = {}
+-                self._lock = _threading.Lock()
+-                self._checks = 0
+-
+-            def check(self, h):
+-                key = str(getattr(h, "client_address", ("unknown",))[0])
+-                now = _time.time()
+-                with self._lock:
+-                    self._checks += 1
+-                    if self._checks % self.prune_interval == 0:
+-                        cutoff = now - (self.window * 10)
+-                        self._hits = {k: [t for t in v if t > cutoff] for k, v in self._hits.items()}
+-                    hits = [t for t in self._hits.get(key, []) if now - t < self.window]
+-                    if len(hits) >= self.max_burst:
+-                        return False
+-                    hits.append(now)
+-                    self._hits[key] = hits
+-                    return True
+-
+-        _handle_stt_elevenlabs_token._limiter = _TokenLimiter()
+-    if not _handle_stt_elevenlabs_token._limiter.check(handler):
+-        from api.helpers import bad as _bad
+-        return _bad(handler, "rate limit exceeded — please wait", 429)
+-
+-    # ElevenLabs API key: env → Hermes .env (same fallback chain as TTS).
+-    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+-    if not api_key:
+-        try:
+-            from api.onboarding import _load_env_file
+-            from api.profiles import get_active_hermes_home
+-            api_key = _load_env_file(get_active_hermes_home() / ".env").get("ELEVENLABS_API_KEY", "")
+-        except Exception:
+-            pass
+-    if not api_key:
+-        from api.helpers import bad as _bad
+-        return _bad(handler, "ELEVENLABS_API_KEY not configured", 503)
+-
+-    from urllib.request import Request, urlopen
+-    try:
+-        req = Request(
+-            "https://api.elevenlabs.io/v1/single-use-token/realtime_scribe",
+-            data=b"",
+-            headers={"xi-api-key": api_key, "Accept": "application/json"},
+-        )
+-        with urlopen(req, timeout=15) as resp:
+-            payload = json.loads(resp.read().decode("utf-8") or "{}")
+-        token = str(payload.get("token") or "").strip()
+-        if not token:
+-            logger.warning("ElevenLabs single-use token response missing 'token'")
+-            from api.helpers import bad as _bad
+-            return _bad(handler, "ElevenLabs token mint failed", 502)
+-        return j(handler, {"ok": True, "token": token})
+-    except Exception:
+-        logger.exception("ElevenLabs single-use token mint failed")
+-        from api.helpers import bad as _bad
+-        return _bad(handler, "ElevenLabs token mint failed", 502)
+-
+-
+ def _html_preview_with_blank_base(raw: bytes) -> bytes:
+     base = '<base target="_blank">'
+     text = raw.decode("utf-8", errors="replace")
+diff --git a/api/upload.py b/api/upload.py
+index e523caa2..52c216e9 100644
+--- a/api/upload.py
++++ b/api/upload.py
+@@ -437,12 +437,25 @@ def handle_transcribe(handler):
+             return j(handler, {'error': 'Speech-to-text is unavailable on this server'}, status=503)
+         # Optional request-level STT provider override (e.g. the voice-assistant
+         # extension forwards the user's engine choice: local/groq/openai/mistral/
+-        # xai/elevenlabs/deepinfra). Empty = server auto-detect (config wins).
+-        # Only pass the kwarg when set, so callers/tests using the 1-arg form
+-        # keep working.
++        # xai/elevenlabs/deepinfra). Hermes' transcribe_audio() does not accept a
++        # provider kwarg — it routes by model name. Map the extension's provider
++        # names to model names so the override actually works.
++        # Empty = server auto-detect (config wins).
++        _STT_PROVIDER_MODELS = {
++            'local': None,           # local faster-whisper, no model override needed
++            'groq': 'whisper-large-v3-turbo',
++            'openai': 'whisper-1',
++            'mistral': 'whisper-1',  # Mistral Voxtral not wired yet; fall back
++            'xai': 'whisper-1',
++            'deepinfra': 'whisper-large-v3',
++        }
+         provider = str(fields.get('provider') or '').strip()
+-        if provider:
+-            result = transcribe_audio(temp_path, provider=provider)
++        if provider and provider in _STT_PROVIDER_MODELS:
++            model_override = _STT_PROVIDER_MODELS[provider]
++            if model_override:
++                result = transcribe_audio(temp_path, model=model_override)
++            else:
++                result = transcribe_audio(temp_path)
+         else:
+             result = transcribe_audio(temp_path)
+         if not result.get('success'):
