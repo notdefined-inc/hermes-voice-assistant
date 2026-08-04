@@ -1,5 +1,5 @@
 /**
- * Voice Assistant Extension v4.3.7 for Hermes WebUI
+ * Voice Assistant Extension v4.3.8 for Hermes WebUI
  *
  * Battle-tested stack:
  *  - Silero VAD (@ricky0123/vad-web v0.0.24) from CDN — neural network voice
@@ -11,45 +11,55 @@
  *    tied to the active stream; VAD paused during speech output to prevent
  *    self-triggering feedback.
  *
- * v4.3.7: FIX "previous response skipped / only speaks the last ones". A fully
+ * v4.3.8: FIX "never starts speaking the first response". Two root causes:
+ * (1) acceptStreamingDelta gated speech on pendingStt — a completed response
+ * was deferred into STREAM_SPEECH.deferred while follow-up STT ran, so the
+ * user heard nothing of response 1. Gate is now pendingDelivery (steer) only.
+ * (2) queueStreamingSentence guarded on streamId match at playback time — a
+ * steer that changed streamId mid-chain silently skipped all queued sentences.
+ * Guard is now PLAYBACK.isCurrent(token) only (barge-in handles interruption).
+ * (3) Steer path no longer calls resetStreamingResponse(stream, true) which
+ * killed in-flight speech; it resets text buffer but keeps the playback chain.
+ *
+ * v4.3.8: FIX "previous response skipped / only speaks the last ones". A fully
  * completed answer (SSE done) was HELD while follow-up STT stayed pending, so a
  * later steer could merge. But when the follow-up instead became a fresh turn,
  * beginAgentTurn silently discarded the held response — it was never spoken.
  * New coordinator flushPendingFinal() delivers it before the fresh turn, and
  * startFreshFollowup waits for that speech to finish before resetting.
  *
- * v4.3.7: STT mode selector in settings panel (hybrid / live / batch) +
+ * v4.3.8: STT mode selector in settings panel (hybrid / live / batch) +
  * configurable race-grace window. Panel widened to 360px and grouped into
  * Conversation / Transcription / Speech synthesis sections.
  *
- * v4.3.7: FIX spurious/slow turns: only server-CONFIRMED live STT text may win
- * the race. v4.3.7's race trusted a 20s-timeout partial from WLK's
+ * v4.3.8: FIX spurious/slow turns: only server-CONFIRMED live STT text may win
+ * the race. v4.3.8's race trusted a 20s-timeout partial from WLK's
  * localagreement (measured: "and load will out." sent to agent, correct batch
  * text arrived 15-45s later and was discarded). LiveSttSession now flags
  * confirmedViaReadyStop; unconfirmed timeouts defer to authoritative batch.
  *
- * v4.3.7: RACE live STT vs batch transcription. WLK runs
+ * v4.3.8: RACE live STT vs batch transcription. WLK runs
  * --backend-policy localagreement which takes 20-30s to settle on this 2-vCPU
  * box (measured: ready_to_stop +18s/+27s/+32s, 3x 'Live STT EMPTY' → batch).
  * Old code waited the full live timeout THEN fell to batch serially (~35s).
  * Now: 2.5s live grace, then batch starts in parallel — whichever returns real
  * text first wins. Fast live path unchanged; slow path recovers in batch time.
  *
- * v4.3.7: FIX "final response miss sometimes". (1) Non-speakable sentences
+ * v4.3.8: FIX "final response miss sometimes". (1) Non-speakable sentences
  * (e.g. a lone emoji "😄") are now skipped before TTS — they were POSTed to
  * Supertonic with an effectively-empty body, got HTTP 400, and the uncaught
  * error killed the tail sentence so text showed on screen but was never spoken.
  * (2) A TTS prefetch that fails (429/400) no longer silently drops that chunk;
  * the whole sentence falls back to speakText which re-fetches every chunk.
  *
- * v4.3.7: FIX live-STT results being thrown away. finish() timed out after
+ * v4.3.8: FIX live-STT results being thrown away. finish() timed out after
  * 3000ms while WhisperLiveKit on the VPS needs 6-30s to agree on final text
  * (ready_to_stop). The 3s timeout resolved with empty → wasted the good 161-char
  * transcript that arrived moments later at ready_to_stop → fell to the 21s
  * batch transcribe → garbled/short text went to the agent. finish() now waits
  * up to 20000ms for ready_to_stop (per-session override finishTimeoutMs).
  *
- * v4.3.7: FIX live-STT failure after the first utterance. Each utterance now
+ * v4.3.8: FIX live-STT failure after the first utterance. Each utterance now
  * gets its own WhisperLiveKit session (one WS + one ready_to_stop per utterance)
  * instead of a single shared session whose start() force-closed the previous
  * utterance's pending finish. This was causing "Live STT EMPTY → batch fallback"
@@ -487,7 +497,7 @@
       '<div class="va-toggle' + (CFG.truncateEnabled ? ' va-on' : '') + '" id="va-truncate-toggle"><div class="va-toggle-knob"></div></div></div>',
       '<div class="va-setting-row" id="va-truncate-row" style="display:' + (CFG.truncateEnabled ? 'flex' : 'none') + '"><div><label>Max chars</label></div>',
       '<input type="number" id="va-truncate-input" min="60" max="4000" step="10" value="' + CFG.truncateChars + '" style="width:90px;"></div>',
-      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v4.3.7 · Per-utterance live STT · Streaming TTS · Barge-in</div>',
+      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v4.3.8 · Per-utterance live STT · Streaming TTS · Barge-in</div>',
     ].join('');
   }
 
@@ -1513,7 +1523,17 @@
         if (accepted) {
           vaDbg('STEER', 'Steer accepted by stream ' + targetStream);
           clearVoiceComposerDraft(outText);
-          resetStreamingResponse(targetStream, true);
+          // Don't kill in-flight speech when a steer is accepted. The old
+          // cancelPlayback=true stopped response 1 mid-sentence to start
+          // response 2. Instead, let response 1 finish naturally; the new
+          // stream's tokens will queue behind it via STREAM_SPEECH.chain.
+          // Reset the text buffer but keep the playback chain alive.
+          STREAM_TEXT.reset(targetStream);
+          STREAM_SPEECH.streamId = targetStream;
+          STREAM_SPEECH.sawTokens = false;
+          // Deferred sentences from the pre-steer response stay in the chain
+          // and will play before the new stream's sentences.
+          STREAM_SPEECH.finalizing = false;
           TURN.resolveDelivery('steer');
           setPhase('processing');
           return;
@@ -1641,7 +1661,12 @@
     var sentences = STREAM_TEXT.push(delta);
     if (!sentences.length) return;
     var snap = TURN.snapshot();
-    if (snap.pendingStt || snap.pendingDelivery) {
+    // Gate on pendingDelivery (steer in progress) ONLY — not pendingStt.
+    // Previously pendingStt gated speech too, so a completed response never
+    // started speaking while follow-up STT was running. The user heard nothing
+    // of response 1 ("never starts speaking the first response"). Now sentences
+    // play immediately; barge-in handles the case where the user speaks over TTS.
+    if (snap.pendingDelivery) {
       Array.prototype.push.apply(STREAM_SPEECH.deferred, sentences);
       return;
     }
@@ -1650,7 +1675,8 @@
 
   function releaseDeferredStreamingSpeech() {
     var snap = TURN.snapshot();
-    if (snap.pendingStt || snap.pendingDelivery || !STREAM_SPEECH.deferred.length) return;
+    // Same gate change as acceptStreamingDelta: pendingDelivery only.
+    if (snap.pendingDelivery || !STREAM_SPEECH.deferred.length) return;
     var ready = STREAM_SPEECH.deferred.splice(0);
     for (var i = 0; i < ready.length; i++) queueStreamingSentence(ready[i]);
   }
@@ -1683,14 +1709,14 @@
     STREAM_SPEECH.chain = STREAM_SPEECH.chain.catch(function (err) {
       console.warn('[VA ' + vaTs() + '] [TTS] Streaming TTS chunk failed; continuing:', err);
     }).then(function () {
-      if (!PLAYBACK.isCurrent(token) || STREAM_SPEECH.streamId !== streamId) return;
+      if (!PLAYBACK.isCurrent(token)) return;
       setPhase('speaking');
       return prefetchPromise.then(function (chunks) {
-        if (!PLAYBACK.isCurrent(token) || STREAM_SPEECH.streamId !== streamId) return;
+        if (!PLAYBACK.isCurrent(token)) return;
         vaDbg('TTS', 'Playing sentence "' + sentence.slice(0, 40) + '" with ' + (chunks ? chunks.length : 0) + ' prefetched chunks');
         return playPrefetchedSentence(sentence, token, chunks);
       }).then(function () {
-        if (!PLAYBACK.isCurrent(token) || STREAM_SPEECH.streamId !== streamId) return;
+        if (!PLAYBACK.isCurrent(token)) return;
         if (!STREAM_SPEECH.finalizing && STATE.expectingReply) setPhase('processing');
       });
     });
@@ -2255,7 +2281,7 @@
     hookSSE();
     checkCapabilities();
     testWasmEval();
-    vaDbg('BOOT', 'Voice Assistant v4.3.7 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
+    vaDbg('BOOT', 'Voice Assistant v4.3.8 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
       stt: CFG.streamingSttEnabled, tts: CFG.ttsEngine, voice: CFG.ttsVoice,
       crisp: CFG.crispPrompt, truncate: CFG.truncateEnabled, autoListen: CFG.autoListen,
     }));
