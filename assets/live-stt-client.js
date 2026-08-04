@@ -12,9 +12,13 @@
 
   // Reuse the pipeline's timestamped logger when present (browser), else a
   // silent no-op so Node unit tests never emit console noise.
-  var dbg = (typeof window !== 'undefined' && typeof window.vaDbg === 'function')
-    ? function (tag, msg) { window.vaDbg('WLK-' + tag, msg); }
-    : function () {};
+  // NOTE: resolve lazily at CALL time — this file loads before voice-assistant.js
+  // defines window.vaDbg, so a module-load-time check would bind a dead no-op.
+  function dbg(tag, msg) {
+    if (typeof window !== 'undefined' && typeof window.vaDbg === 'function') {
+      window.vaDbg('WLK-' + tag, msg);
+    }
+  }
   var STT_T0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
   function elapsed() {
     return Math.round(((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - STT_T0);

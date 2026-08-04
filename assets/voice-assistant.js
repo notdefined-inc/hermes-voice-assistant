@@ -1,5 +1,5 @@
 /**
- * Voice Assistant Extension v4.3.0 for Hermes WebUI
+ * Voice Assistant Extension v4.3.1 for Hermes WebUI
  *
  * Battle-tested stack:
  *  - Silero VAD (@ricky0123/vad-web v0.0.24) from CDN — neural network voice
@@ -10,6 +10,13 @@
  *  - Mic fetch/mute during TTS playback — audio only captured via MediaRecorder
  *    tied to the active stream; VAD paused during speech output to prevent
  *    self-triggering feedback.
+ *
+ * v4.3.1: FIX live-STT failure after the first utterance. Each utterance now
+ * gets its own WhisperLiveKit session (one WS + one ready_to_stop per utterance)
+ * instead of a single shared session whose start() force-closed the previous
+ * utterance's pending finish. This was causing "Live STT EMPTY → batch fallback"
+ * (8-11s) whenever the user spoke again before WLK finalized — the "words get
+ * cut / not smooth" symptom.
  *
  * v4.3.0: Every pipeline stage now logs with a wall-clock + elapsed-since-boot
  * timestamp and a [TAG] group. Tags: BOOT VAD STT SSE SEND TURN STEER TTS AUDIO
@@ -417,7 +424,7 @@
       '<div class="va-toggle' + (CFG.truncateEnabled ? ' va-on' : '') + '" id="va-truncate-toggle"><div class="va-toggle-knob"></div></div></div>',
       '<div class="va-setting-row" id="va-truncate-row" style="display:' + (CFG.truncateEnabled ? 'flex' : 'none') + '"><div><label>Max chars</label></div>',
       '<input type="number" id="va-truncate-input" min="60" max="4000" step="10" value="' + CFG.truncateChars + '" style="width:90px;"></div>',
-      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v4.3.0 · Timestamped pipeline logging · Live STT · Streaming TTS · Barge-in</div>',
+      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v4.3.1 · Per-utterance live STT · Streaming TTS · Barge-in</div>',
     ].join('');
   }
 
@@ -878,7 +885,7 @@
 
   async function ensureLiveSttCapture() {
     if (!CFG.streamingSttEnabled || !STATE.audioStream || !window.LiveSttSession) return false;
-    if (STATE.liveSttContext && STATE.liveSttProcessor && STATE.liveStt) {
+    if (STATE.liveSttContext && STATE.liveSttProcessor) {
       if (STATE.liveSttContext.state === 'suspended') {
         try { await STATE.liveSttContext.resume(); } catch (_) {}
       }
@@ -897,28 +904,15 @@
       var gain = ctx.createGain();
       gain.gain.value = 0;
       var encoder = new window.StreamingPcm16Encoder(ctx.sampleRate, 16000);
-      var session = new window.LiveSttSession({
-        url: liveSttUrl(),
-        preRollBytes: Math.max(16000, Math.round(16000 * 2 * CFG.preRollMs / 1000)),
-        onTranscript: function (text) {
-          STATE.liveTranscript = text;
-          if (statusLabel && (STATE.phase === 'listening' || STATE.phase === 'transcribing')) {
-            statusLabel.textContent = liveTranscriptStatus(STATE.phase === 'transcribing' ? 'Finalizing' : 'Listening');
-            statusLabel.classList.add('va-visible');
-          }
-        },
-        onError: function (err) {
-          console.warn('[VA ' + vaTs() + '] [STT] Live STT unavailable; final batch STT remains active:', err);
-          if (!STATE.liveSttErrorShown) {
-            STATE.liveSttErrorShown = true;
-            showToast('Voice: Live transcript unavailable — final transcription still works', 4000);
-          }
-        },
-      });
+      // One LiveSttSession per utterance (matches WhisperLiveKit's protocol of
+      // one WS connection + one ready_to_stop per utterance). Routing PCM to
+      // whichever session is CURRENT means a rapid next utterance's new session
+      // never clobbers the previous utterance's pending finish().
       processor.onaudioprocess = function (event) {
-        if (!STATE.liveStt || STATE.liveStt !== session) return;
+        var sess = STATE.liveStt;
+        if (!sess || !sess.active) return;
         var pcm = encoder.encode(event.inputBuffer.getChannelData(0));
-        if (pcm.byteLength) session.pushPcm(pcm);
+        if (pcm.byteLength) sess.pushPcm(pcm);
       };
       source.connect(processor);
       processor.connect(gain);
@@ -928,7 +922,6 @@
       STATE.liveSttProcessor = processor;
       STATE.liveSttGain = gain;
       STATE.liveSttEncoder = encoder;
-      STATE.liveStt = session;
       vaDbg('STT', 'Live STT PCM capture initialized at ' + ctx.sampleRate + ' Hz, ws=' + liveSttUrl());
       return true;
     } catch (err) {
@@ -937,11 +930,52 @@
     }
   }
 
+  function makeLiveSttSession() {
+    return new window.LiveSttSession({
+      url: liveSttUrl(),
+      preRollBytes: Math.max(16000, Math.round(16000 * 2 * CFG.preRollMs / 1000)),
+      onTranscript: function (text) {
+        STATE.liveTranscript = text;
+        if (statusLabel && (STATE.phase === 'listening' || STATE.phase === 'transcribing')) {
+          statusLabel.textContent = liveTranscriptStatus(STATE.phase === 'transcribing' ? 'Finalizing' : 'Listening');
+          statusLabel.classList.add('va-visible');
+        }
+      },
+      onError: function (err) {
+        console.warn('[VA ' + vaTs() + '] [STT] Live STT unavailable; final batch STT remains active:', err);
+        if (!STATE.liveSttErrorShown) {
+          STATE.liveSttErrorShown = true;
+          showToast('Voice: Live transcript unavailable — final transcription still works', 4000);
+        }
+      },
+    });
+  }
+
   function startLiveSttUtterance() {
     STATE.liveTranscript = '';
     if (!CFG.streamingSttEnabled) return;
     ensureLiveSttCapture().then(function (ready) {
-      if (ready && STATE.liveStt) STATE.liveStt.start();
+      if (!ready) return;
+      // Always create a FRESH session for this utterance. The previous one keeps
+      // finalizing on its own (its finish() promise was captured at speech end),
+      // so a quick follow-up no longer aborts the in-flight ready_to_stop.
+      var prev = STATE.liveStt;
+      var session = makeLiveSttSession();
+      // Carry the pre-roll PCM accumulated while the mic was idle into the new
+      // session so the utterance's leading edge is still transcribed.
+      if (prev && prev.ring && prev.ring.parts && prev.ring.parts.length) {
+        session.ring.parts = prev.ring.parts.slice();
+        session.ring.bytes = prev.ring.bytes;
+      }
+      STATE.liveStt = session;
+      if (!STATE.liveSttSessions) STATE.liveSttSessions = [];
+      STATE.liveSttSessions.push(session);
+      // Trim registry: drop sessions that already finalized or were closed so
+      // a long conversation doesn't accumulate dead WebSocket refs.
+      STATE.liveSttSessions = STATE.liveSttSessions.filter(function (s) {
+        return s !== session && (s.active || s.finishing);
+      });
+      session.start();
     });
   }
 
@@ -951,12 +985,18 @@
   }
 
   function cancelLiveSttUtterance() {
-    if (STATE.liveStt) STATE.liveStt.close();
+    if (STATE.liveStt && !STATE.liveStt.finishing) STATE.liveStt.close();
     STATE.liveTranscript = '';
   }
 
   function closeLiveSttCapture() {
-    cancelLiveSttUtterance();
+    if (STATE.liveSttSessions) {
+      for (var i = 0; i < STATE.liveSttSessions.length; i++) {
+        try { STATE.liveSttSessions[i].close(); } catch (_) {}
+      }
+      STATE.liveSttSessions = [];
+    }
+    if (STATE.liveStt) { try { STATE.liveStt.close(); } catch (_) {} }
     if (STATE.liveSttProcessor) {
       try { STATE.liveSttProcessor.disconnect(); } catch (_) {}
       STATE.liveSttProcessor.onaudioprocess = null;
@@ -1993,7 +2033,7 @@
     hookSSE();
     checkCapabilities();
     testWasmEval();
-    vaDbg('BOOT', 'Voice Assistant v4.3.0 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
+    vaDbg('BOOT', 'Voice Assistant v4.3.1 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
       stt: CFG.streamingSttEnabled, tts: CFG.ttsEngine, voice: CFG.ttsVoice,
       crisp: CFG.crispPrompt, truncate: CFG.truncateEnabled, autoListen: CFG.autoListen,
     }));
