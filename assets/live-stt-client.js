@@ -167,6 +167,12 @@
       try {
         var msg = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
         if (msg && msg.type === 'ready_to_stop') {
+          // The ready_to_stop message may carry the final flushed transcript
+          // (lines + buffer_transcription). Parse it before resolving.
+          var finalText = transcriptFromWlkMessage(msg);
+          if (finalText && finalText.length > self.lastTranscript.length) {
+            self.lastTranscript = finalText;
+          }
           if (self._finishResolve) {
             var resolve = self._finishResolve;
             self._finishResolve = null;
