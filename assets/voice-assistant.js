@@ -907,7 +907,8 @@
   }
 
   function finishLiveSttUtterance() {
-    if (STATE.liveStt) STATE.liveStt.finish();
+    if (STATE.liveStt) return STATE.liveStt.finish();
+    return Promise.resolve('');
   }
 
   function cancelLiveSttUtterance() {
@@ -1005,13 +1006,13 @@
         },
         onSpeechEnd: function (audio) {
           console.log('[VA] Speech end (%d samples)', audio ? audio.length : 0);
-          finishLiveSttUtterance();
+          var sttDonePromise = finishLiveSttUtterance();
           if (STATE.openSpeechCaptures > 0) STATE.openSpeechCaptures -= 1;
           else TURN.beginStt(); // defensive: keep begin/end balanced
           // Silero hands us the full utterance INCLUDING pre-roll padding —
           // encode to WAV ourselves; never use MediaRecorder (it starts too
           // late and loses the first ~200-400ms of speech).
-          finishWithAudio(audio);
+          finishWithAudio(audio, sttDonePromise);
         },
         onVADMisfire: function () {
           console.log('[VA] VAD misfire — too short');
@@ -1082,7 +1083,7 @@
   }
 
   // Called by Silero's onSpeechEnd with the captured utterance.
-  function finishWithAudio(audio) {
+  function finishWithAudio(audio, sttDonePromise) {
     if (!audio || !audio.length) { TURN.endStt(); recoverAfterStt(); return; }
 
     // Guard: require the utterance to actually contain speech energy, else
@@ -1104,33 +1105,24 @@
 
     setPhase('transcribing');
     var generation = STATE.stopGeneration;
-    var stt = STATE.liveStt;
 
     STT_QUEUE.add(function () {
       if (generation !== STATE.stopGeneration) return '';
 
-      // If live STT is available, give WhisperLiveKit ~300ms to process the
-      // final audio chunk and deliver the complete transcript. Then read it.
-      if (CFG.streamingSttEnabled && stt) {
-        return new Promise(function (resolve) {
-          var before = String(stt.lastTranscript || '').trim();
-          setTimeout(function () {
-            var after = String(stt.lastTranscript || '').trim();
-            if (after.length >= 2) {
-              console.log('[VA] Live STT transcript accepted: "' + after.slice(0, 60) + '"');
-              resolve(after);
-              return;
-            }
-            if (before.length >= 2) {
-              console.log('[VA] Live STT using pre-wait transcript: "' + before.slice(0, 60) + '"');
-              resolve(before);
-              return;
-            }
-            console.log('[VA] Live STT empty, falling back to batch');
-            resolve(null);
-          }, 300);
-        }).then(function (liveText) {
-          if (liveText) return liveText;
+      // Await the live STT finish promise — resolves when WhisperLiveKit
+      // confirms it's done processing (ready_to_stop message), not when
+      // we guess it's done with an arbitrary delay.
+      if (sttDonePromise) {
+        return sttDonePromise.then(function (liveText) {
+          var clean = String(liveText || '').trim();
+          if (clean.length >= 2) {
+            console.log('[VA] Live STT transcript (server-confirmed): "' + clean.slice(0, 60) + '"');
+            return clean;
+          }
+          console.log('[VA] Live STT empty, falling back to batch');
+          return window.withVoiceTimeout(function () { return batchTranscribe(blob); }, 45000);
+        }).catch(function () {
+          console.log('[VA] Live STT failed, falling back to batch');
           return window.withVoiceTimeout(function () { return batchTranscribe(blob); }, 45000);
         });
       }
