@@ -96,6 +96,25 @@
     return true;
   };
 
+  // Deliver a held, complete response NOW (used right before a new turn begins).
+  // The normal _schedule() path holds a finished candidate while later-follow-up
+  // STT is still pending so a *steer* can merge into the same stream. But if the
+  // follow-up turns out to be a NEW turn instead, that held response used to be
+  // silently discarded — the user heard nothing of a fully-completed answer
+  // ("only speaks the last ones"). Callers invoke this when a fresh turn is about
+  // to start and no steer is possible, so the previous answer still gets spoken.
+  VoiceTurnCoordinator.prototype.flushPendingFinal = function () {
+    if (!this.candidate || !this.waiting) return false;
+    if (this.candidate.turn !== this.turn) return false;
+    var text = String(this.candidate.text || '').trim();
+    this.candidate = null;
+    this.turnCompleted = false;
+    this.waiting = false;
+    this._cancel();
+    if (text) this.onFinal(text);
+    return true;
+  };
+
   VoiceTurnCoordinator.prototype._schedule = function () {
     this._cancel();
     if (!this.waiting || !this.candidate || this.pendingStt || this.pendingDelivery) return;

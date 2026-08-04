@@ -1,5 +1,5 @@
 /**
- * Voice Assistant Extension v4.3.6 for Hermes WebUI
+ * Voice Assistant Extension v4.3.7 for Hermes WebUI
  *
  * Battle-tested stack:
  *  - Silero VAD (@ricky0123/vad-web v0.0.24) from CDN — neural network voice
@@ -11,38 +11,45 @@
  *    tied to the active stream; VAD paused during speech output to prevent
  *    self-triggering feedback.
  *
- * v4.3.6: STT mode selector in settings panel (hybrid / live / batch) +
+ * v4.3.7: FIX "previous response skipped / only speaks the last ones". A fully
+ * completed answer (SSE done) was HELD while follow-up STT stayed pending, so a
+ * later steer could merge. But when the follow-up instead became a fresh turn,
+ * beginAgentTurn silently discarded the held response — it was never spoken.
+ * New coordinator flushPendingFinal() delivers it before the fresh turn, and
+ * startFreshFollowup waits for that speech to finish before resetting.
+ *
+ * v4.3.7: STT mode selector in settings panel (hybrid / live / batch) +
  * configurable race-grace window. Panel widened to 360px and grouped into
  * Conversation / Transcription / Speech synthesis sections.
  *
- * v4.3.6: FIX spurious/slow turns: only server-CONFIRMED live STT text may win
- * the race. v4.3.6's race trusted a 20s-timeout partial from WLK's
+ * v4.3.7: FIX spurious/slow turns: only server-CONFIRMED live STT text may win
+ * the race. v4.3.7's race trusted a 20s-timeout partial from WLK's
  * localagreement (measured: "and load will out." sent to agent, correct batch
  * text arrived 15-45s later and was discarded). LiveSttSession now flags
  * confirmedViaReadyStop; unconfirmed timeouts defer to authoritative batch.
  *
- * v4.3.6: RACE live STT vs batch transcription. WLK runs
+ * v4.3.7: RACE live STT vs batch transcription. WLK runs
  * --backend-policy localagreement which takes 20-30s to settle on this 2-vCPU
  * box (measured: ready_to_stop +18s/+27s/+32s, 3x 'Live STT EMPTY' → batch).
  * Old code waited the full live timeout THEN fell to batch serially (~35s).
  * Now: 2.5s live grace, then batch starts in parallel — whichever returns real
  * text first wins. Fast live path unchanged; slow path recovers in batch time.
  *
- * v4.3.6: FIX "final response miss sometimes". (1) Non-speakable sentences
+ * v4.3.7: FIX "final response miss sometimes". (1) Non-speakable sentences
  * (e.g. a lone emoji "😄") are now skipped before TTS — they were POSTed to
  * Supertonic with an effectively-empty body, got HTTP 400, and the uncaught
  * error killed the tail sentence so text showed on screen but was never spoken.
  * (2) A TTS prefetch that fails (429/400) no longer silently drops that chunk;
  * the whole sentence falls back to speakText which re-fetches every chunk.
  *
- * v4.3.6: FIX live-STT results being thrown away. finish() timed out after
+ * v4.3.7: FIX live-STT results being thrown away. finish() timed out after
  * 3000ms while WhisperLiveKit on the VPS needs 6-30s to agree on final text
  * (ready_to_stop). The 3s timeout resolved with empty → wasted the good 161-char
  * transcript that arrived moments later at ready_to_stop → fell to the 21s
  * batch transcribe → garbled/short text went to the agent. finish() now waits
  * up to 20000ms for ready_to_stop (per-session override finishTimeoutMs).
  *
- * v4.3.6: FIX live-STT failure after the first utterance. Each utterance now
+ * v4.3.7: FIX live-STT failure after the first utterance. Each utterance now
  * gets its own WhisperLiveKit session (one WS + one ready_to_stop per utterance)
  * instead of a single shared session whose start() force-closed the previous
  * utterance's pending finish. This was causing "Live STT EMPTY → batch fallback"
@@ -480,7 +487,7 @@
       '<div class="va-toggle' + (CFG.truncateEnabled ? ' va-on' : '') + '" id="va-truncate-toggle"><div class="va-toggle-knob"></div></div></div>',
       '<div class="va-setting-row" id="va-truncate-row" style="display:' + (CFG.truncateEnabled ? 'flex' : 'none') + '"><div><label>Max chars</label></div>',
       '<input type="number" id="va-truncate-input" min="60" max="4000" step="10" value="' + CFG.truncateChars + '" style="width:90px;"></div>',
-      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v4.3.6 · Per-utterance live STT · Streaming TTS · Barge-in</div>',
+      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v4.3.7 · Per-utterance live STT · Streaming TTS · Barge-in</div>',
     ].join('');
   }
 
@@ -1523,12 +1530,30 @@
   function startFreshFollowup(outText) {
     var previousStream = TURN.snapshot().currentStreamId || activeStreamId();
     clearVoiceComposerDraft(outText);
-    return waitForAgentIdle(15000).then(function () {
+    // If a complete response is still held (deferred because follow-up STT was
+    // pending), deliver it BEFORE starting this new turn. Previously the held
+    // candidate was silently discarded here, so the user heard nothing of a
+    // fully-completed answer ("only speaks the last ones"). Flush it, then
+    // wait for that speech to finish before the fresh turn takes over.
+    var flushed = TURN.flushPendingFinal();
+    var gate = flushed ? waitForSpeechChainIdle(25000) : Promise.resolve();
+    return gate.catch(function () {}).then(function () {
+      return waitForAgentIdle(15000);
+    }).then(function () {
       resetStreamingResponse('', true);
       TURN.beginAgentTurn({ afterStreamId: previousStream });
       TURN.resolveDelivery('new-turn');
       sendViaComposer(outText);
     });
+  }
+
+  // Resolve when the current TTS chain (captured now) has fully finished, so a
+  // just-flushed response is actually spoken before the next turn resets state.
+  function waitForSpeechChainIdle(timeoutMs) {
+    var chain = STREAM_SPEECH.chain;
+    if (!chain) return Promise.resolve();
+    return window.withVoiceTimeout(function () { return chain; }, timeoutMs)
+      .catch(function () {});
   }
 
   function waitForAgentIdle(timeoutMs) {
@@ -2230,7 +2255,7 @@
     hookSSE();
     checkCapabilities();
     testWasmEval();
-    vaDbg('BOOT', 'Voice Assistant v4.3.6 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
+    vaDbg('BOOT', 'Voice Assistant v4.3.7 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
       stt: CFG.streamingSttEnabled, tts: CFG.ttsEngine, voice: CFG.ttsVoice,
       crisp: CFG.crispPrompt, truncate: CFG.truncateEnabled, autoListen: CFG.autoListen,
     }));

@@ -67,6 +67,43 @@ function testFailedOrEmptySttReleasesDeferredFirstAnswer() {
   assert.deepEqual(spoken, ['complete answer']);
 }
 
+function testFlushPendingFinalDeliversHeldResponseBeforeFreshTurn() {
+  const spoken = [];
+  const clock = fakeClock();
+  const c = new VoiceTurnCoordinator({ onFinal: t => spoken.push(t), settleMs: 1, ...clock });
+  c.beginAgentTurn();
+  c.bindStream('s1');
+  c.beginStt();                       // follow-up STT still pending → holds candidate
+  c.noteDone('full first answer', 's1');
+  clock.flush();
+  assert.deepEqual(spoken, []);       // intentionally deferred (steer might merge)
+
+  // Follow-up could not steer → it becomes a fresh turn. The held complete
+  // response must be delivered now, not silently discarded.
+  assert.equal(c.flushPendingFinal(), true);
+  assert.deepEqual(spoken, ['full first answer']);
+
+  // The follow-up's STT resolves (endStt) with no candidate left → no noise.
+  c.endStt();
+  clock.flush();
+
+  // A later fresh turn starts cleanly with no stale candidate.
+  c.beginAgentTurn();                  // fresh turn (re-arms waiting)
+  c.beginStt();
+  c.noteDone('second answer', 's2');
+  c.endStt();
+  clock.flush();
+  assert.deepEqual(spoken, ['full first answer', 'second answer']);
+}
+
+function testFlushPendingFinalIsNoOpWithoutHeldCandidate() {
+  const spoken = [];
+  const c = new VoiceTurnCoordinator({ onFinal: t => spoken.push(t), settleMs: 1 });
+  c.beginAgentTurn();
+  assert.equal(c.flushPendingFinal(), false);
+  assert.deepEqual(spoken, []);
+}
+
 function testCaptureMigrationAddsBoundaryPaddingWithoutOverwritingCustomValues() {
   assert.deepEqual(
     migrateCaptureSettings({ preRollMs: 300, minSpeechMs: 400, endSilenceMs: 650 }),
@@ -127,6 +164,8 @@ async function main() {
     testDefersDoneWhileSttPendingAndUsesFinalResponse,
     testCompletionIsMatchedToItsActualStreamNotEventCount,
     testFailedOrEmptySttReleasesDeferredFirstAnswer,
+    testFlushPendingFinalDeliversHeldResponseBeforeFreshTurn,
+    testFlushPendingFinalIsNoOpWithoutHeldCandidate,
     testCaptureMigrationAddsBoundaryPaddingWithoutOverwritingCustomValues,
     testBargeInCancelsCurrentPlaybackAndInvalidatesItsCompletion,
   ]) test();
