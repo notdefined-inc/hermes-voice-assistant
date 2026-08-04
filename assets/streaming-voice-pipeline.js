@@ -67,15 +67,31 @@
     var start = 0;
     for (var i = 0; i < this.buffer.length; i++) {
       var ch = this.buffer[i];
+
+      // Secondary break points: comma or semicolon. Only flush if enough text
+      // has accumulated (60+ chars) to avoid choppy, unnatural TTS breaks.
+      if (ch === ',' || ch === ';') {
+        var next = this.buffer[i + 1] || '';
+        if (!/\s/.test(next)) continue;
+        var sinceStart = i - start;
+        if (sinceStart < 60) continue;
+        var segment = this.buffer.slice(start, i).trim();
+        if (segment) complete.push(segment);
+        start = i + 1;
+        while (start < this.buffer.length && /\s/.test(this.buffer[start])) start += 1;
+        i = start - 1;
+        continue;
+      }
+
       if (ch !== '.' && ch !== '!' && ch !== '?') continue;
-      var next = this.buffer[i + 1] || '';
+      var nextT = this.buffer[i + 1] || '';
       var atEnd = i === this.buffer.length - 1;
       // A period at the current token boundary may still become a decimal (2.1),
       // abbreviation, or ellipsis. Wait for following whitespace or final flush.
-      var terminal = ch === '.' ? /\s/.test(next) : (atEnd || /\s/.test(next));
+      var terminal = ch === '.' ? /\s/.test(nextT) : (atEnd || /\s/.test(nextT));
       if (!terminal) continue;
       var end = i + 1;
-      while (end < this.buffer.length && /["'”’\])}]/.test(this.buffer[end])) end += 1;
+      while (end < this.buffer.length && /["'"')]}]/.test(this.buffer[end])) end += 1;
       if (end < this.buffer.length && !/\s/.test(this.buffer[end])) continue;
       var sentence = this.buffer.slice(start, end).trim();
       if (sentence) complete.push(sentence);

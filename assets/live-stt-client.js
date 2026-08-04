@@ -146,6 +146,8 @@
     this.active = true;
     this.finishing = false;
     this.lastTranscript = '';
+    this._finishResolve = null;
+    this._finishTimeout = null;
     var initial = this.ring.drain();
     var explicit = toBytes(preRoll);
     this.pending = [];
@@ -165,6 +167,12 @@
       try {
         var msg = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
         if (msg && msg.type === 'ready_to_stop') {
+          if (self._finishResolve) {
+            var resolve = self._finishResolve;
+            self._finishResolve = null;
+            if (self._finishTimeout) { clearTimeout(self._finishTimeout); self._finishTimeout = null; }
+            resolve(self.lastTranscript);
+          }
           self.onReady(self.lastTranscript);
           self.close();
           return;
@@ -186,9 +194,21 @@
   };
 
   LiveSttSession.prototype.finish = function () {
-    if (!this.active) return;
+    if (!this.active) return Promise.resolve(this.lastTranscript);
+    if (this.finishing) return Promise.resolve(this.lastTranscript);
     this.finishing = true;
-    if (this.socket && this.socket.readyState === 1) this.socket.send(new Uint8Array(0));
+    var self = this;
+    return new Promise(function (resolve) {
+      self._finishResolve = resolve;
+      self._finishTimeout = setTimeout(function () {
+        if (self._finishResolve === resolve) {
+          self._finishResolve = null;
+          self._finishTimeout = null;
+          resolve(self.lastTranscript);
+        }
+      }, 3000);
+      if (self.socket && self.socket.readyState === 1) self.socket.send(new Uint8Array(0));
+    });
   };
 
   LiveSttSession.prototype.close = function () {
@@ -197,6 +217,8 @@
     this.active = false;
     this.finishing = false;
     this.pending = [];
+    if (this._finishTimeout) { clearTimeout(this._finishTimeout); this._finishTimeout = null; }
+    this._finishResolve = null;
     if (ws && ws.readyState < 2 && typeof ws.close === 'function') {
       try { ws.close(); } catch (_) {}
     }

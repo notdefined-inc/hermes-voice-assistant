@@ -907,7 +907,8 @@
   }
 
   function finishLiveSttUtterance() {
-    if (STATE.liveStt) STATE.liveStt.finish();
+    // finish() is now called inside finishWithAudio via the live STT path.
+    // This is a no-op stub kept for backward compatibility.
   }
 
   function cancelLiveSttUtterance() {
@@ -1104,12 +1105,34 @@
 
     setPhase('transcribing');
     var generation = STATE.stopGeneration;
-    // The VPS has only two CPUs. Running several faster-whisper jobs at once
-    // made them 3-4x slower and allowed later utterances to finish first.
-    // Queue inference in speech order while Silero keeps capturing new audio.
+
+    // Try live STT transcript first — if WhisperLiveKit already has the text,
+    // skip the batch re-transcribe entirely (saves 500-2000ms on 2 vCPU).
+    var livePromise = null;
+    if (CFG.streamingSttEnabled && STATE.liveStt && STATE.liveStt.active) {
+      livePromise = STATE.liveStt.finish().then(function (text) {
+        var clean = String(text || '').trim();
+        if (clean.length >= 2) {
+          console.log('[VA] Live STT transcript accepted: "' + clean.slice(0, 60) + '"');
+          return clean;
+        }
+        console.log('[VA] Live STT empty, falling back to batch');
+        return null;
+      }).catch(function () { return null; });
+    }
+
     STT_QUEUE.add(function () {
       if (generation !== STATE.stopGeneration) return '';
-      return window.withVoiceTimeout(function () { return transcribeAudio(blob); }, 45000);
+      return window.withVoiceTimeout(function () {
+        // If live STT gave us text, skip batch entirely
+        if (livePromise) {
+          return livePromise.then(function (liveText) {
+            if (liveText) return liveText;
+            return batchTranscribe(blob);
+          });
+        }
+        return batchTranscribe(blob);
+      }, 45000);
     }).then(function (text) {
       TURN.endStt();
       if (generation !== STATE.stopGeneration) return;
@@ -1125,6 +1148,10 @@
       showToast('Voice: Transcription failed');
       recoverAfterStt();
     });
+  }
+
+  function batchTranscribe(blob) {
+    return transcribeAudio(blob);
   }
 
   function recoverAfterStt() {
@@ -1351,15 +1378,73 @@
     }
     var token = STREAM_SPEECH.playbackToken;
     var streamId = STREAM_SPEECH.streamId;
+
+    // Prefetch: kick off the TTS fetch for this sentence while the previous
+    // one is still playing, so audio is ready when playback reaches it.
+    var prefetchPromise = prefetchSentenceAudio(sentence, token, streamId);
+
     STREAM_SPEECH.chain = STREAM_SPEECH.chain.catch(function (err) {
       console.warn('[VA] Streaming TTS chunk failed; continuing:', err);
     }).then(function () {
       if (!PLAYBACK.isCurrent(token) || STREAM_SPEECH.streamId !== streamId) return;
       setPhase('speaking');
-      return speakText(sentence, token).then(function () {
+      return prefetchPromise.then(function (chunks) {
+        if (!PLAYBACK.isCurrent(token) || STREAM_SPEECH.streamId !== streamId) return;
+        return playPrefetchedSentence(sentence, token, chunks);
+      }).then(function () {
         if (!PLAYBACK.isCurrent(token) || STREAM_SPEECH.streamId !== streamId) return;
         if (!STREAM_SPEECH.finalizing && STATE.expectingReply) setPhase('processing');
       });
+    });
+  }
+
+  // Prefetch TTS audio for a sentence. Returns a Promise<array of {url, text}>.
+  // Falls back gracefully — if prefetch fails, speakText will re-fetch.
+  function prefetchSentenceAudio(sentence, token, streamId) {
+    var prose = crispify(sentence);
+    var sentences = splitIntoSentences(prose);
+    var chunks = chunkSentences(sentences, CFG.ttsChunkSize);
+    if (!chunks.length) return Promise.resolve([]);
+    // For browser engine, no prefetch needed
+    if (CFG.ttsEngine === 'browser') return Promise.resolve(null);
+    return Promise.all(chunks.map(function (chunk) {
+      return fetchAudioBlob(chunk).then(function (url) {
+        if (!PLAYBACK.isCurrent(token) || STREAM_SPEECH.streamId !== streamId) {
+          if (url) URL.revokeObjectURL(url);
+          return null;
+        }
+        return { url: url, text: chunk };
+      }).catch(function () { return null; });
+    }));
+  }
+
+  function playPrefetchedSentence(sentence, token, prefetched) {
+    // If we have prefetched URLs, play them directly (skip re-fetching)
+    if (prefetched && prefetched.length) {
+      return playPrefetchedChunks(prefetched, token);
+    }
+    // Fallback to normal speakText path
+    return speakText(sentence, token);
+  }
+
+  function playPrefetchedChunks(chunks, playbackToken) {
+    STATE.ttsActive = true;
+    var chain = Promise.resolve();
+    for (var i = 0; i < chunks.length; i++) {
+      if (!chunks[i] || !chunks[i].url) continue;
+      chain = chain.then(function (idx) {
+        return function () {
+          if (!STATE.ttsActive || !PLAYBACK.isCurrent(playbackToken)) return;
+          var chunk = chunks[idx];
+          if (!chunk || !chunk.url) return;
+          return playAudioURL(chunk.url, playbackToken).then(function (completed) {
+            return completed;
+          });
+        };
+      }(i));
+    }
+    return chain.then(function () {
+      if (PLAYBACK.isCurrent(playbackToken)) STATE.ttsActive = false;
     });
   }
 
@@ -1603,7 +1688,6 @@
       await speakBrowserChunks(chunks, playbackToken);
       if (!PLAYBACK.isCurrent(playbackToken)) return;
       STATE.ttsActive = false;
-      await new Promise(function (r) { setTimeout(r, 250); });
       return;
     }
 
@@ -1630,7 +1714,6 @@
 
     if (!PLAYBACK.isCurrent(playbackToken)) return;
     STATE.ttsActive = false;
-    await new Promise(function (r) { setTimeout(r, 250); });
   }
 
   // Sequential browser-engine speech via SpeechSynthesis. A token promise
