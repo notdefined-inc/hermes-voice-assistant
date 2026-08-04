@@ -1,0 +1,101 @@
+diff --git a/api/helpers.py b/api/helpers.py
+index d285cfe4..629a2419 100644
+--- a/api/helpers.py
++++ b/api/helpers.py
+@@ -75,7 +75,7 @@ _CSP_SHARED_POLICY_TEMPLATE = (
+     "default-src 'self' https://*.cloudflareaccess.com; "
+     "object-src 'none'; "
+     "frame-ancestors 'none'; "
+-    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://static.cloudflareinsights.com blob:; "
++    "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://cdn.jsdelivr.net https://static.cloudflareinsights.com blob:; "
+     "worker-src blob: 'self' https://cdn.jsdelivr.net; "
+     "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
+     "img-src 'self' data: https: blob:; "
+diff --git a/api/routes.py b/api/routes.py
+index 9049fad3..2c56d3a6 100644
+--- a/api/routes.py
++++ b/api/routes.py
+@@ -280,7 +280,7 @@ _CLIENT_EVENT_RATE_LIMIT_LOCK = threading.Lock()
+ _CLIENT_EVENT_RATE_LIMIT_WINDOW_SECONDS = 60
+ _CLIENT_EVENT_RATE_LIMIT_MAX = 30
+ _CLIENT_EVENT_MAX_BODY_BYTES = 4 * 1024
+-_EXTENSION_SIDECAR_PROXY_MAX_RESPONSE_BYTES = 512 * 1024
++_EXTENSION_SIDECAR_PROXY_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+ _CLIENT_EVENT_ALLOWED_FIELDS = {
+     "event": 64,
+     "source": 80,
+@@ -5692,7 +5692,7 @@ def _handle_extension_sidecar_proxy(
+             method=method,
+         )
+         opener = _extension_sidecar_proxy_same_origin_opener(target["origin"])
+-        with opener.open(request, timeout=10) as response:
++        with opener.open(request, timeout=120) as response:
+             body = _read_extension_sidecar_proxy_body(response)
+             return _send_extension_sidecar_proxy_response(
+                 handler,
+@@ -18545,16 +18545,22 @@ def _handle_tts(handler, parsed):
+             from api.helpers import bad as _bad
+             return _bad(handler, "ELEVENLABS_API_KEY not configured", 503)
+ 
+-        # Resolve voice_id from Hermes config.yaml → env fallback
++        # Resolve voice_id from request → Hermes config.yaml → env fallback
++        # Request `voice` (if supplied) overrides config, so the WebUI
++        # extension can switch engine-specific voice profiles per-session.
+         voice_id = "pNInz6obpgDQGcFmaJgB"  # Adam (same default as hermes-agent config.yaml)
+         model_id = "eleven_multilingual_v2"
++        req_voice = (data.get("voice") or "").strip()
++        if req_voice and re.fullmatch(r'[A-Za-z0-9_-]+', req_voice):
++            voice_id = req_voice
+         try:
+             from api.config import get_config
+             tts_cfg = (get_config() or {}).get("tts", {})
+             if isinstance(tts_cfg, dict):
+                 el_cfg = tts_cfg.get("elevenlabs", {})
+                 if isinstance(el_cfg, dict):
+-                    voice_id = el_cfg.get("voice_id", voice_id)
++                    if not req_voice or not re.fullmatch(r'[A-Za-z0-9_-]+', req_voice):
++                        voice_id = el_cfg.get("voice_id", voice_id)
+                     model_id = el_cfg.get("model", model_id) or el_cfg.get("model_id", model_id)
+                     # ^ treat empty string as "not set" — fall through to default
+         except Exception:
+@@ -18694,6 +18700,8 @@ def _handle_tts(handler, parsed):
+         "zh-CN-XiaoxiaoNeural", "zh-CN-XiaoyiNeural", "zh-CN-YunxiNeural",
+         "zh-CN-YunjianNeural", "zh-CN-YunyangNeural",
+         "en-US-AriaNeural", "en-US-GuyNeural",
++        "en-GB-SoniaNeural", "en-GB-RyanNeural", "en-GB-LibbyNeural",
++        "en-GB-ThomasNeural", "en-US-JennyNeural",
+         "fr-CA-AntoineNeural", "fr-CA-JeanNeural",
+         "fr-CA-SylvieNeural", "fr-CA-ThierryNeural",
+         "fr-FR-DeniseNeural", "fr-FR-EloiseNeural", "fr-FR-HenriNeural",
+diff --git a/api/upload.py b/api/upload.py
+index ba5999ad..82ca9a3f 100644
+--- a/api/upload.py
++++ b/api/upload.py
+@@ -436,6 +436,27 @@ def handle_transcribe(handler):
+         except ImportError:
+             return j(handler, {'error': 'Speech-to-text is unavailable on this server'}, status=503)
+         result = transcribe_audio(temp_path)
++        # Optional request-level STT provider override (e.g. the voice-assistant
++        # extension forwards the user's engine choice: local/groq/openai/mistral/
++        # xai/elevenlabs/deepinfra). Hermes' transcribe_audio() does not accept a
++        # provider kwarg — it routes by model name. Map the extension's provider
++        # names to model names so the override actually works.
++        # Empty = server auto-detect (config wins).
++        _STT_PROVIDER_MODELS = {
++            'local': None,           # local faster-whisper, no model override needed
++            'groq': 'whisper-large-v3-turbo',
++            'openai': 'whisper-1',
++            'mistral': 'whisper-1',  # Mistral Voxtral not wired yet; fall back
++            'xai': 'whisper-1',
++            'deepinfra': 'whisper-large-v3',
++        }
++        provider = str(fields.get('provider') or '').strip()
++        if provider and provider in _STT_PROVIDER_MODELS:
++            model_override = _STT_PROVIDER_MODELS[provider]
++            if model_override:
++                result = transcribe_audio(temp_path, model=model_override)
++            else:
++                result = transcribe_audio(temp_path)
+         if not result.get('success'):
+             msg = str(result.get('error') or 'Transcription failed')
+             status = 503 if 'unavailable' in msg.lower() or 'not configured' in msg.lower() else 400
