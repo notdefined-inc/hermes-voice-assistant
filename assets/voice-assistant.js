@@ -1104,25 +1104,37 @@
 
     setPhase('transcribing');
     var generation = STATE.stopGeneration;
-
-    // Read the live STT transcript synchronously. By the time Silero fires
-    // onSpeechEnd (after 650-850ms of silence), the localagreement policy has
-    // already committed the text. No need to await finish() — just read it.
-    var liveText = null;
-    if (CFG.streamingSttEnabled && STATE.liveStt) {
-      liveText = String(STATE.liveStt.lastTranscript || '').trim();
-      if (liveText.length >= 2) {
-        console.log('[VA] Live STT transcript accepted: "' + liveText.slice(0, 60) + '"');
-      } else {
-        console.log('[VA] Live STT empty, will fall back to batch');
-        liveText = null;
-      }
-    }
+    var stt = STATE.liveStt;
 
     STT_QUEUE.add(function () {
       if (generation !== STATE.stopGeneration) return '';
-      // If we already have the live transcript, skip batch entirely
-      if (liveText) return Promise.resolve(liveText);
+
+      // If live STT is available, give WhisperLiveKit ~300ms to process the
+      // final audio chunk and deliver the complete transcript. Then read it.
+      if (CFG.streamingSttEnabled && stt) {
+        return new Promise(function (resolve) {
+          var before = String(stt.lastTranscript || '').trim();
+          setTimeout(function () {
+            var after = String(stt.lastTranscript || '').trim();
+            if (after.length >= 2) {
+              console.log('[VA] Live STT transcript accepted: "' + after.slice(0, 60) + '"');
+              resolve(after);
+              return;
+            }
+            if (before.length >= 2) {
+              console.log('[VA] Live STT using pre-wait transcript: "' + before.slice(0, 60) + '"');
+              resolve(before);
+              return;
+            }
+            console.log('[VA] Live STT empty, falling back to batch');
+            resolve(null);
+          }, 300);
+        }).then(function (liveText) {
+          if (liveText) return liveText;
+          return window.withVoiceTimeout(function () { return batchTranscribe(blob); }, 45000);
+        });
+      }
+
       return window.withVoiceTimeout(function () { return batchTranscribe(blob); }, 45000);
     }).then(function (text) {
       TURN.endStt();
@@ -1391,6 +1403,23 @@
 
   // Prefetch TTS audio for a sentence. Returns a Promise<array of {url, text}>.
   // Falls back gracefully — if prefetch fails, speakText will re-fetch.
+  // Fetches are serialized via TTS_FETCH_CHAIN to prevent 429 rate limiting.
+  var TTS_FETCH_CHAIN = Promise.resolve();
+  function serializedTtsFetch(text, token, streamId) {
+    var run = TTS_FETCH_CHAIN.then(function () {
+      return fetchAudioBlob(text);
+    });
+    // Keep the chain alive even if this fetch fails
+    TTS_FETCH_CHAIN = run.then(function () {}, function () {});
+    return run.then(function (url) {
+      if (!PLAYBACK.isCurrent(token) || STREAM_SPEECH.streamId !== streamId) {
+        if (url) URL.revokeObjectURL(url);
+        return null;
+      }
+      return { url: url, text: text };
+    }).catch(function () { return null; });
+  }
+
   function prefetchSentenceAudio(sentence, token, streamId) {
     var prose = crispify(sentence);
     var sentences = splitIntoSentences(prose);
@@ -1398,15 +1427,19 @@
     if (!chunks.length) return Promise.resolve([]);
     // For browser engine, no prefetch needed
     if (CFG.ttsEngine === 'browser') return Promise.resolve(null);
-    return Promise.all(chunks.map(function (chunk) {
-      return fetchAudioBlob(chunk).then(function (url) {
-        if (!PLAYBACK.isCurrent(token) || STREAM_SPEECH.streamId !== streamId) {
-          if (url) URL.revokeObjectURL(url);
-          return null;
-        }
-        return { url: url, text: chunk };
-      }).catch(function () { return null; });
-    }));
+    // Serialize fetches: chain them so only one TTS request is in-flight
+    var result = Promise.resolve([]);
+    for (var i = 0; i < chunks.length; i++) {
+      result = result.then(function (acc, chunk) {
+        return function () {
+          return serializedTtsFetch(chunk, token, streamId).then(function (item) {
+            if (item) acc.push(item);
+            return acc;
+          });
+        };
+      }(result, chunks[i]));
+    }
+    return result;
   }
 
   function playPrefetchedSentence(sentence, token, prefetched) {
