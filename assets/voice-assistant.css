@@ -1,12 +1,12 @@
 /* ═══ Voice Assistant Extension CSS ═══ */
 
-/* ── Floating orb button ─────────────────────────────────────── */
+/* ── Floating orb button (transparent container for mascot) ──── */
 #va-orb {
   position: fixed;
   bottom: 80px;
   right: 24px;
-  width: 56px;
-  height: 56px;
+  width: 64px;
+  height: 64px;
   border-radius: 50%;
   border: none;
   cursor: pointer;
@@ -14,76 +14,149 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 24px;
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+  background: transparent !important;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: none;
+  overflow: visible;
+  padding: 0;
 }
 
-:root.dark #va-orb {
-  background: rgba(99, 102, 241, 0.2);
-  border: 1px solid rgba(99, 102, 241, 0.4);
-  color: #a5b4fc;
-}
-:root:not(.dark) #va-orb {
-  background: rgba(99, 102, 241, 0.15);
-  border: 1px solid rgba(99, 102, 241, 0.3);
-  color: #4f46e5;
-}
-
-#va-orb:hover {
-  transform: scale(1.08);
-  box-shadow: 0 6px 32px rgba(99, 102, 241, 0.4);
+/* Mascot image inside the orb — this is what gets animated */
+#va-mascot-img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  transition: filter 0.4s ease;
+  user-select: none;
+  -webkit-user-drag: none;
+  pointer-events: none;
+  filter: drop-shadow(0 2px 8px rgba(0, 0, 0, 0.25));
 }
 
-/* Active states */
+#va-mascot-speech {
+  position: absolute;
+  bottom: 100%;
+  right: 50%;
+  transform: translateX(50%) translateY(-4px);
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 600;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s;
+}
+
+/* Hover — pet perks up */
+#va-orb:hover #va-mascot-img {
+  filter: drop-shadow(0 4px 16px rgba(99, 102, 241, 0.3));
+}
+
+/* ── Pet state animations ────────────────────────────────────── */
+
+/* IDLE — gentle breathing, eyes open */
+.va-pet-idle {
+  animation: va-breathe 3.5s ease-in-out infinite;
+}
+@keyframes va-breathe {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.04); }
+}
+
+/* AWAKE — brief alert, looks around */
+.va-pet-awake {
+  animation: va-look-around 2s ease-in-out;
+}
+@keyframes va-look-around {
+  0% { transform: scale(0.9) rotate(-5deg); }
+  30% { transform: scale(1.08) rotate(3deg); }
+  60% { transform: scale(1.05) rotate(-2deg); }
+  100% { transform: scale(1) rotate(0); }
+}
+
+/* LISTENING — alert, ears perked, gentle tilt side to side */
+.va-pet-listening {
+  animation: va-listen-tilt 2s ease-in-out infinite;
+}
+@keyframes va-listen-tilt {
+  0%, 100% { transform: scale(1.06) rotate(-3deg); }
+  50% { transform: scale(1.06) rotate(3deg); }
+}
+
+/* THINKING — curious bounce + slight squish */
+.va-pet-thinking {
+  animation: va-think-bounce 1.8s ease-in-out infinite;
+}
+@keyframes va-think-bounce {
+  0%, 100% { transform: scale(1, 1) translateY(0); }
+  20% { transform: scale(1.1, 0.9) translateY(2px); }
+  40% { transform: scale(0.95, 1.08) translateY(-6px); }
+  60% { transform: scale(1.05, 0.97) translateY(-2px); }
+  80% { transform: scale(1, 1) translateY(0); }
+}
+
+/* SPEAKING — enthusiastic happy bounce */
+.va-pet-speaking {
+  animation: va-speak-bounce 0.5s ease-in-out infinite;
+}
+@keyframes va-speak-bounce {
+  0%, 100% { transform: scale(1.05) translateY(0); }
+  50% { transform: scale(1.12) translateY(-8px); }
+}
+
+/* SLEEPING — gentle Zzz float + dim */
+.va-pet-sleeping {
+  animation: va-sleep-breathe 4s ease-in-out infinite;
+  filter: drop-shadow(0 2px 8px rgba(0, 0, 0, 0.15)) brightness(0.7) saturate(0.6) !important;
+}
+@keyframes va-sleep-breathe {
+  0%, 100% { transform: scale(0.92); }
+  50% { transform: scale(0.96); }
+}
+
+/* Blink — quick scale pulse */
+.va-blink {
+  animation: va-blink 0.15s ease-out !important;
+}
+@keyframes va-blink {
+  0% { transform: scaleY(1); }
+  50% { transform: scaleY(0.85); }
+  100% { transform: scaleY(1); }
+}
+
+/* ── Orb ambient glow per state ──────────────────────────────── */
+/* The orb itself stays transparent; we add glow via box-shadow */
 #va-orb.va-listening {
-  background: rgba(239, 68, 68, 0.25) !important;
-  border-color: rgba(239, 68, 68, 0.6) !important;
-  color: #f87171 !important;
+  box-shadow: 0 0 24px 4px rgba(239, 68, 68, 0.25);
   animation: va-pulse-listening 1.5s ease-in-out infinite;
 }
-
 #va-orb.va-speaking {
-  background: rgba(34, 197, 94, 0.25) !important;
-  border-color: rgba(34, 197, 94, 0.6) !important;
-  color: #4ade80 !important;
+  box-shadow: 0 0 24px 4px rgba(34, 197, 94, 0.25);
   animation: va-pulse-speaking 0.8s ease-in-out infinite;
 }
-
 #va-orb.va-processing {
-  background: rgba(245, 158, 11, 0.25) !important;
-  border-color: rgba(245, 158, 11, 0.6) !important;
-  color: #fbbf24 !important;
+  box-shadow: 0 0 20px 4px rgba(245, 158, 11, 0.2);
 }
-
 #va-orb.va-armed {
-  background: rgba(99, 102, 241, 0.35) !important;
-  border-color: rgba(129, 140, 248, 0.7) !important;
-  color: #c7d2fe !important;
-  animation: va-pulse-armed 3s ease-in-out infinite;
+  box-shadow: 0 0 16px 2px rgba(99, 102, 241, 0.15);
 }
 
 @keyframes va-pulse-listening {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.3); }
   50% { box-shadow: 0 0 0 12px rgba(239, 68, 68, 0); }
 }
 @keyframes va-pulse-speaking {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.4); }
+  0%, 100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.3); }
   50% { box-shadow: 0 0 0 8px rgba(34, 197, 94, 0); }
-}
-@keyframes va-pulse-armed {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.3); }
-  50% { box-shadow: 0 0 0 6px rgba(99, 102, 241, 0); }
 }
 
 /* ── Audio level indicator ───────────────────────────────────── */
 #va-level-bar {
   position: fixed;
-  bottom: 144px;
+  bottom: 152px;
   right: 24px;
-  width: 56px;
+  width: 64px;
   height: 4px;
   border-radius: 2px;
   background: rgba(128, 128, 128, 0.2);

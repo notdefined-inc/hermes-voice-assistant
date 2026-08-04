@@ -1,5 +1,5 @@
 /**
- * Voice Assistant Extension v4.3.9 for Hermes WebUI
+ * Voice Assistant Extension v5.0 for Hermes WebUI
  *
  * Battle-tested stack:
  *  - Silero VAD (@ricky0123/vad-web v0.0.24) from CDN — neural network voice
@@ -11,14 +11,20 @@
  *    tied to the active stream; VAD paused during speech output to prevent
  *    self-triggering feedback.
  *
- * v4.3.9: FIX "steer delivered but never appended / next message does not speak".
+ * v5.0: MASCOT PET UI — replace mic emoji orb with logo mascot image.
+ * Deterministic pet state machine: idle (breathing), awake (alert),
+ * listening (tilt), thinking (bounce), speaking (excited bounce), sleeping
+ * (dim + slow breathe after 2 min idle). Blinks every 4s, wakes on hover.
+ * Orb is now transparent; mascot carries the animations. No pipeline changes.
+ *
+ * v5.0: FIX "steer delivered but never appended / next message does not speak".
  * Two SSE handlers gated on STATE.expectingReply: (1) the token handler blocked
  * a steer response's tokens from being queued for TTS when expectingReply had
  * been cleared (e.g. by barge-in); (2) the done handler silently ignored a
  * completed response when expectingReply was false. Both now process tokens
  * and deliver responses regardless of expectingReply state.
  *
- * v4.3.9: FIX "never starts speaking the first response". Two root causes:
+ * v5.0: FIX "never starts speaking the first response". Two root causes:
  * (1) acceptStreamingDelta gated speech on pendingStt — a completed response
  * was deferred into STREAM_SPEECH.deferred while follow-up STT ran, so the
  * user heard nothing of response 1. Gate is now pendingDelivery (steer) only.
@@ -28,45 +34,45 @@
  * (3) Steer path no longer calls resetStreamingResponse(stream, true) which
  * killed in-flight speech; it resets text buffer but keeps the playback chain.
  *
- * v4.3.9: FIX "previous response skipped / only speaks the last ones". A fully
+ * v5.0: FIX "previous response skipped / only speaks the last ones". A fully
  * completed answer (SSE done) was HELD while follow-up STT stayed pending, so a
  * later steer could merge. But when the follow-up instead became a fresh turn,
  * beginAgentTurn silently discarded the held response — it was never spoken.
  * New coordinator flushPendingFinal() delivers it before the fresh turn, and
  * startFreshFollowup waits for that speech to finish before resetting.
  *
- * v4.3.9: STT mode selector in settings panel (hybrid / live / batch) +
+ * v5.0: STT mode selector in settings panel (hybrid / live / batch) +
  * configurable race-grace window. Panel widened to 360px and grouped into
  * Conversation / Transcription / Speech synthesis sections.
  *
- * v4.3.9: FIX spurious/slow turns: only server-CONFIRMED live STT text may win
- * the race. v4.3.9's race trusted a 20s-timeout partial from WLK's
+ * v5.0: FIX spurious/slow turns: only server-CONFIRMED live STT text may win
+ * the race. v5.0's race trusted a 20s-timeout partial from WLK's
  * localagreement (measured: "and load will out." sent to agent, correct batch
  * text arrived 15-45s later and was discarded). LiveSttSession now flags
  * confirmedViaReadyStop; unconfirmed timeouts defer to authoritative batch.
  *
- * v4.3.9: RACE live STT vs batch transcription. WLK runs
+ * v5.0: RACE live STT vs batch transcription. WLK runs
  * --backend-policy localagreement which takes 20-30s to settle on this 2-vCPU
  * box (measured: ready_to_stop +18s/+27s/+32s, 3x 'Live STT EMPTY' → batch).
  * Old code waited the full live timeout THEN fell to batch serially (~35s).
  * Now: 2.5s live grace, then batch starts in parallel — whichever returns real
  * text first wins. Fast live path unchanged; slow path recovers in batch time.
  *
- * v4.3.9: FIX "final response miss sometimes". (1) Non-speakable sentences
+ * v5.0: FIX "final response miss sometimes". (1) Non-speakable sentences
  * (e.g. a lone emoji "😄") are now skipped before TTS — they were POSTed to
  * Supertonic with an effectively-empty body, got HTTP 400, and the uncaught
  * error killed the tail sentence so text showed on screen but was never spoken.
  * (2) A TTS prefetch that fails (429/400) no longer silently drops that chunk;
  * the whole sentence falls back to speakText which re-fetches every chunk.
  *
- * v4.3.9: FIX live-STT results being thrown away. finish() timed out after
+ * v5.0: FIX live-STT results being thrown away. finish() timed out after
  * 3000ms while WhisperLiveKit on the VPS needs 6-30s to agree on final text
  * (ready_to_stop). The 3s timeout resolved with empty → wasted the good 161-char
  * transcript that arrived moments later at ready_to_stop → fell to the 21s
  * batch transcribe → garbled/short text went to the agent. finish() now waits
  * up to 20000ms for ready_to_stop (per-session override finishTimeoutMs).
  *
- * v4.3.9: FIX live-STT failure after the first utterance. Each utterance now
+ * v5.0: FIX live-STT failure after the first utterance. Each utterance now
  * gets its own WhisperLiveKit session (one WS + one ready_to_stop per utterance)
  * instead of a single shared session whose start() force-closed the previous
  * utterance's pending finish. This was causing "Live STT EMPTY → batch fallback"
@@ -402,9 +408,29 @@
     orb = document.createElement('button');
     orb.id = 'va-orb';
     orb.title = 'Voice Assistant (Ctrl+Shift+V)';
-    orb.innerHTML = '🎤';
+    orb.type = 'button';
+    // Mascot image replaces the old mic emoji. The <img> carries the pet
+    // animations; the outer #va-orb is just a transparent round container.
+    var mascotUrl = '';
+    try {
+      // WebUI extensions are served from /extensions/<id>/assets/
+      var scripts = document.querySelectorAll('script[src*="voice-assistant"]');
+      for (var i = 0; i < scripts.length; i++) {
+        var m = String(scripts[i].src).match(/^(.*\/)voice-assistant\.js/);
+        if (m) { mascotUrl = m[1] + 'mascot.png'; break; }
+      }
+    } catch (_) {}
+    if (!mascotUrl) mascotUrl = '/extensions/voice-assistant/assets/mascot.png';
+    orb.innerHTML =
+      '<img id="va-mascot-img" src="' + mascotUrl + '" alt="Twilla pet" draggable="false">' +
+      '<div id="va-mascot-speech"></div>';
     orb.addEventListener('click', onOrbClick);
     document.body.appendChild(orb);
+
+    // Start the deterministic pet state machine.
+    PetState.init();
+    // Poke on click — pet reacts.
+    orb.addEventListener('click', function () { PetState.poke(); });
 
     levelBar = document.createElement('div');
     levelBar.id = 'va-level-bar';
@@ -504,7 +530,7 @@
       '<div class="va-toggle' + (CFG.truncateEnabled ? ' va-on' : '') + '" id="va-truncate-toggle"><div class="va-toggle-knob"></div></div></div>',
       '<div class="va-setting-row" id="va-truncate-row" style="display:' + (CFG.truncateEnabled ? 'flex' : 'none') + '"><div><label>Max chars</label></div>',
       '<input type="number" id="va-truncate-input" min="60" max="4000" step="10" value="' + CFG.truncateChars + '" style="width:90px;"></div>',
-      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v4.3.9 · Per-utterance live STT · Streaming TTS · Barge-in</div>',
+      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v5.0 · Per-utterance live STT · Streaming TTS · Barge-in</div>',
     ].join('');
   }
 
@@ -826,29 +852,129 @@
   //  Visual State
   // ═══════════════════════════════════════════════════════════════
 
+  // ═══════════════════════════════════════════════════════════════
+  //  Pet State Machine — deterministic mascot behaviours
+  // ═══════════════════════════════════════════════════════════════
+
+  var PetState = {
+    SLEEP_TIMEOUT_MS: 120000,    // 2 min idle → sleep
+    IDLE_BLINK_INTERVAL: 4000,   // blink every ~4s when awake
+    SLEEP_CHECK_INTERVAL: 3000,  // check if should sleep
+
+    state: 'awake',   // awake | idle | listening | thinking | speaking | sleeping
+    _lastActivity: Date.now(),
+    _sleepTimer: null,
+    _blinkTimer: null,
+    _idleCheckTimer: null,
+
+    init: function () {
+      var self = this;
+      this._lastActivity = Date.now();
+
+      // Sleep check: if no activity for SLEEP_TIMEOUT_MS, go to sleep.
+      this._idleCheckTimer = setInterval(function () {
+        if (self.state === 'sleeping') return;
+        if (self.state === 'listening' || self.state === 'thinking' || self.state === 'speaking') {
+          self._lastActivity = Date.now();
+          return;
+        }
+        var elapsed = Date.now() - self._lastActivity;
+        if (elapsed > self.SLEEP_TIMEOUT_MS) {
+          self.setState('sleeping');
+        }
+      }, this.SLEEP_CHECK_INTERVAL);
+
+      // Idle blink: when awake/idle, add a quick blink class.
+      this._blinkTimer = setInterval(function () {
+        if (self.state === 'sleeping') return;
+        var img = document.getElementById('va-mascot-img');
+        if (!img) return;
+        img.classList.add('va-blink');
+        setTimeout(function () { img.classList.remove('va-blink'); }, 150);
+      }, this.IDLE_BLINK_INTERVAL);
+
+      // Hover: pet wakes up / reacts.
+      var orbEl = document.getElementById('va-orb');
+      if (orbEl) {
+        orbEl.addEventListener('mouseenter', function () {
+          self.poke();
+        });
+      }
+    },
+
+    /** Called whenever ANY meaningful activity happens. */
+    poke: function () {
+      this._lastActivity = Date.now();
+      if (this.state === 'sleeping') {
+        this.setState('awake');
+        var self = this;
+        setTimeout(function () {
+          if (self.state === 'awake') self.setState('idle');
+        }, 2000);
+      }
+    },
+
+    setState: function (newState) {
+      if (this.state === newState) return;
+      var img = document.getElementById('va-mascot-img');
+      if (img) {
+        img.className = img.className.replace(/va-pet-\S+/g, '').trim();
+        img.classList.add('va-pet-' + newState);
+      }
+      this.state = newState;
+      if (newState !== 'sleeping') this._lastActivity = Date.now();
+      vaDbg('PET', 'state → ' + newState);
+    },
+  };
+
+  // ═══════════════════════════════════════════════════════════════
+  //  Phase / state display
+  // ═══════════════════════════════════════════════════════════════
+
   function setPhase(phase) {
     STATE.phase = phase;
     if (!orb) return;
     orb.className = '';
     levelBar.classList.remove('va-visible');
     statusLabel.classList.remove('va-visible');
+
+    // Map pipeline phases → pet states.
+    var petMap = {
+      idle: 'idle', listening: 'listening', transcribing: 'thinking',
+      processing: 'thinking', speaking: 'speaking',
+    };
+
     switch (phase) {
-      case 'idle': orb.innerHTML = '🎤'; break;
+      case 'idle':
+        orb.classList.add('va-armed');
+        statusLabel.textContent = '';
+        PetState.setState('idle');
+        break;
       case 'listening':
-        orb.innerHTML = '🎙️'; orb.classList.add('va-listening');
+        orb.classList.add('va-listening');
         levelBar.classList.add('va-visible');
         statusLabel.textContent = STATE.liveTranscript ? liveTranscriptStatus('Listening') : 'Listening…';
-        statusLabel.classList.add('va-visible'); break;
+        statusLabel.classList.add('va-visible');
+        PetState.setState('listening');
+        break;
       case 'transcribing':
-        orb.innerHTML = '⏳'; orb.classList.add('va-processing');
+        orb.classList.add('va-processing');
         statusLabel.textContent = STATE.liveTranscript ? liveTranscriptStatus('Finalizing') : 'Transcribing…';
-        statusLabel.classList.add('va-visible'); break;
+        statusLabel.classList.add('va-visible');
+        PetState.setState('thinking');
+        break;
       case 'processing':
-        orb.innerHTML = '🤖'; orb.classList.add('va-processing');
-        statusLabel.textContent = 'Thinking…'; statusLabel.classList.add('va-visible'); break;
+        orb.classList.add('va-processing');
+        statusLabel.textContent = 'Thinking…';
+        statusLabel.classList.add('va-visible');
+        PetState.setState('thinking');
+        break;
       case 'speaking':
-        orb.innerHTML = '🔊'; orb.classList.add('va-speaking');
-        statusLabel.textContent = 'Speaking…'; statusLabel.classList.add('va-visible'); break;
+        orb.classList.add('va-speaking');
+        statusLabel.textContent = 'Speaking…';
+        statusLabel.classList.add('va-visible');
+        PetState.setState('speaking');
+        break;
     }
   }
 
@@ -2306,7 +2432,7 @@
     hookSSE();
     checkCapabilities();
     testWasmEval();
-    vaDbg('BOOT', 'Voice Assistant v4.3.9 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
+    vaDbg('BOOT', 'Voice Assistant v5.0 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
       stt: CFG.streamingSttEnabled, tts: CFG.ttsEngine, voice: CFG.ttsVoice,
       crisp: CFG.crispPrompt, truncate: CFG.truncateEnabled, autoListen: CFG.autoListen,
     }));
