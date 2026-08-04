@@ -1,5 +1,5 @@
 /**
- * Voice Assistant Extension v4.3.3 for Hermes WebUI
+ * Voice Assistant Extension v4.3.4 for Hermes WebUI
  *
  * Battle-tested stack:
  *  - Silero VAD (@ricky0123/vad-web v0.0.24) from CDN — neural network voice
@@ -11,21 +11,28 @@
  *    tied to the active stream; VAD paused during speech output to prevent
  *    self-triggering feedback.
  *
- * v4.3.3: FIX "final response miss sometimes". (1) Non-speakable sentences
+ * v4.3.4: RACE live STT vs batch transcription. WLK runs
+ * --backend-policy localagreement which takes 20-30s to settle on this 2-vCPU
+ * box (measured: ready_to_stop +18s/+27s/+32s, 3x 'Live STT EMPTY' → batch).
+ * Old code waited the full live timeout THEN fell to batch serially (~35s).
+ * Now: 2.5s live grace, then batch starts in parallel — whichever returns real
+ * text first wins. Fast live path unchanged; slow path recovers in batch time.
+ *
+ * v4.3.4: FIX "final response miss sometimes". (1) Non-speakable sentences
  * (e.g. a lone emoji "😄") are now skipped before TTS — they were POSTed to
  * Supertonic with an effectively-empty body, got HTTP 400, and the uncaught
  * error killed the tail sentence so text showed on screen but was never spoken.
  * (2) A TTS prefetch that fails (429/400) no longer silently drops that chunk;
  * the whole sentence falls back to speakText which re-fetches every chunk.
  *
- * v4.3.3: FIX live-STT results being thrown away. finish() timed out after
+ * v4.3.4: FIX live-STT results being thrown away. finish() timed out after
  * 3000ms while WhisperLiveKit on the VPS needs 6-30s to agree on final text
  * (ready_to_stop). The 3s timeout resolved with empty → wasted the good 161-char
  * transcript that arrived moments later at ready_to_stop → fell to the 21s
  * batch transcribe → garbled/short text went to the agent. finish() now waits
  * up to 20000ms for ready_to_stop (per-session override finishTimeoutMs).
  *
- * v4.3.3: FIX live-STT failure after the first utterance. Each utterance now
+ * v4.3.4: FIX live-STT failure after the first utterance. Each utterance now
  * gets its own WhisperLiveKit session (one WS + one ready_to_stop per utterance)
  * instead of a single shared session whose start() force-closed the previous
  * utterance's pending finish. This was causing "Live STT EMPTY → batch fallback"
@@ -438,7 +445,7 @@
       '<div class="va-toggle' + (CFG.truncateEnabled ? ' va-on' : '') + '" id="va-truncate-toggle"><div class="va-toggle-knob"></div></div></div>',
       '<div class="va-setting-row" id="va-truncate-row" style="display:' + (CFG.truncateEnabled ? 'flex' : 'none') + '"><div><label>Max chars</label></div>',
       '<input type="number" id="va-truncate-input" min="60" max="4000" step="10" value="' + CFG.truncateChars + '" style="width:90px;"></div>',
-      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v4.3.3 · Per-utterance live STT · Streaming TTS · Barge-in</div>',
+      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v4.3.4 · Per-utterance live STT · Streaming TTS · Barge-in</div>',
     ].join('');
   }
 
@@ -1209,20 +1216,64 @@
     STT_QUEUE.add(function () {
       if (generation !== STATE.stopGeneration) return '';
 
-      // Await the live STT finish promise — resolves when WhisperLiveKit
-      // confirms it's done processing (ready_to_stop message), not when
-      // we guess it's done with an arbitrary delay.
+      // Race live STT against batch transcription. The WLK server on this box
+      // runs --backend-policy localagreement, which can take 20-30s to settle
+      // (measured). Waiting for it serially and THEN falling back to batch
+      // meant paying live-wait + batch-time back-to-back (~35s). Instead, give
+      // live STT a short grace window; if it hasn't returned text by then,
+      // kick off batch in parallel and take whichever resolves first.
       if (sttDonePromise) {
-        return sttDonePromise.then(function (liveText) {
-          var clean = String(liveText || '').trim();
-          if (clean.length >= 2) {
-            vaDbg('STT', 'Live STT transcript (server-confirmed) in ' + Math.round(performance.now() - t0) + 'ms: "' + clean.slice(0, 60) + '"');
-            return clean;
+        var liveSettled = false;
+        var liveResult = null;
+        return new Promise(function (resolve, reject) {
+          var done = false;
+          function finish(text) {
+            if (done) return;
+            done = true;
+            resolve(text);
           }
-          vaDbg('STT-WARN', 'Live STT EMPTY (' + Math.round(performance.now() - t0) + 'ms) → batch fallback');
-          return window.withVoiceTimeout(function () { return batchTranscribe(blob); }, 45000);
-        }).catch(function (err) {
-          vaDbg('STT-WARN', 'Live STT failed (' + Math.round(performance.now() - t0) + 'ms):', err ? String(err.message || err) : 'unknown');
+
+          // Track live outcome; if it wins with real text, use it.
+          sttDonePromise.then(function (liveText) {
+            liveSettled = true;
+            liveResult = String(liveText || '').trim();
+            if (liveResult.length >= 2) {
+              vaDbg('STT', 'Live STT won race in ' + Math.round(performance.now() - t0) + 'ms: "' + liveResult.slice(0, 60) + '"');
+              finish(liveResult);
+            } else {
+              vaDbg('STT-WARN', 'Live STT settled empty (' + Math.round(performance.now() - t0) + 'ms) — batch continues');
+            }
+          }).catch(function (err) {
+            liveSettled = true;
+            vaDbg('STT-WARN', 'Live STT failed (' + Math.round(performance.now() - t0) + 'ms):', err ? String(err.message || err) : 'unknown');
+          });
+
+          // Grace window: only spin up batch if live STT hasn't already won.
+          // 2.5s is ample for WLK's fast path here; on the slow path the batch
+          // request then overlaps the remaining live wait and both race.
+          setTimeout(function () {
+            if (done) return;
+            window.withVoiceTimeout(function () { return batchTranscribe(blob); }, 45000)
+              .then(function (batchText) {
+                var clean = String(batchText || '').trim();
+                if (clean.length >= 2) {
+                  vaDbg('STT', 'Batch won race in ' + Math.round(performance.now() - t0) + 'ms: "' + clean.slice(0, 60) + '"' +
+                    (liveSettled ? ' (live was ' + (liveResult ? '"' + liveResult.slice(0, 40) + '"' : 'empty') + ')' : ' (live still pending)'));
+                  finish(clean);
+                } else {
+                  vaDbg('STT-WARN', 'Batch returned empty');
+                  // If live is still pending, it may still produce text; if it
+                  // already settled empty, resolve empty to unblock the queue.
+                  if (liveSettled) finish('');
+                }
+              })
+              .catch(function (err) {
+                vaDbg('STT-WARN', 'Batch failed:', err ? String(err.message || err) : 'unknown');
+                // Live still pending → let it decide; else unblock with empty.
+                setTimeout(function () { if (!done) finish(liveSettled ? '' : null); }, 0);
+              });
+          }, 2500);
+        }).catch(function () {
           return window.withVoiceTimeout(function () { return batchTranscribe(blob); }, 45000);
         });
       }
@@ -2074,7 +2125,7 @@
     hookSSE();
     checkCapabilities();
     testWasmEval();
-    vaDbg('BOOT', 'Voice Assistant v4.3.3 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
+    vaDbg('BOOT', 'Voice Assistant v4.3.4 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
       stt: CFG.streamingSttEnabled, tts: CFG.ttsEngine, voice: CFG.ttsVoice,
       crisp: CFG.crispPrompt, truncate: CFG.truncateEnabled, autoListen: CFG.autoListen,
     }));
