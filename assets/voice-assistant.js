@@ -1,5 +1,5 @@
 /**
- * Voice Assistant Extension v3.0 for Hermes WebUI
+ * Voice Assistant Extension v4.3.0 for Hermes WebUI
  *
  * Battle-tested stack:
  *  - Silero VAD (@ricky0123/vad-web v0.0.24) from CDN — neural network voice
@@ -10,10 +10,35 @@
  *  - Mic fetch/mute during TTS playback — audio only captured via MediaRecorder
  *    tied to the active stream; VAD paused during speech output to prevent
  *    self-triggering feedback.
+ *
+ * v4.3.0: Every pipeline stage now logs with a wall-clock + elapsed-since-boot
+ * timestamp and a [TAG] group. Tags: BOOT VAD STT SSE SEND TURN STEER TTS AUDIO
+ * RESP CTRL + WLK-* from the live STT WebSocket client. Look for SSE-TIMING /
+ * TTS-TIMING / STT-WARN / STEER-WARN to find where latency or fallbacks occur.
  */
 
 (function () {
   'use strict';
+
+  // ═══════════════════════════════════════════════════════════════
+  //  Timestamped debug logging — every pipeline stage logs wall-clock
+  //  time + ms-since-boot so delays/stalls are visible in the console.
+  //  Format: [VA 12:34:56.789 +4567ms] [TAG] message
+  // ═══════════════════════════════════════════════════════════════
+
+  var VA_BOOT = Date.now();
+  function vaTs() {
+    var d = new Date();
+    function p(n) { return (n < 10 ? '0' : '') + n; }
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) + '.' + ('00' + d.getMilliseconds()).slice(-3);
+  }
+  function vaDbg(tag, msg) {
+    console.log('[VA ' + vaTs() + ' +' + (Date.now() - VA_BOOT) + 'ms] [' + tag + '] ' + msg);
+  }
+  // Expose for sibling pipeline scripts (live-stt-client, turn coordinator)
+  // so the whole pipeline shares one timestamped log source.
+  window.vaDbg = vaDbg;
+  window.vaTs = vaTs;
 
   // ═══════════════════════════════════════════════════════════════
   //  Config & State
@@ -116,12 +141,16 @@
     liveSttEncoder: null,
     liveTranscript: '',
     liveSttErrorShown: false,
+    // Pipeline timing markers (wall-clock ms) for debugging where time goes.
+    sentAt: 0,
+    firstTokenAt: 0,
+    lastSpeechEndAt: 0,
   };
 
   var TURN = new window.VoiceTurnCoordinator({
     settleMs: 750,
     onFinal: function (text) {
-      console.log('[VA] TURN onFinal fired: text=' + (text ? text.slice(0, 80) + '…' : '(empty)') + ' expectingReply=' + STATE.expectingReply);
+      vaDbg('TURN', 'onFinal fired: text=' + (text ? text.slice(0, 80) + '…' : '(empty)') + ' expectingReply=' + STATE.expectingReply);
       STATE.responseDone = true;
       STATE.responseText = text;
       if (STATE.expectingReply) finalizeStreamingResponse(text);
@@ -137,6 +166,7 @@
     chain: Promise.resolve(),
     playbackToken: null,
     finalizing: false,
+    streamCreatedAt: 0,
   };
 
   function activeStreamId() {
@@ -387,7 +417,7 @@
       '<div class="va-toggle' + (CFG.truncateEnabled ? ' va-on' : '') + '" id="va-truncate-toggle"><div class="va-toggle-knob"></div></div></div>',
       '<div class="va-setting-row" id="va-truncate-row" style="display:' + (CFG.truncateEnabled ? 'flex' : 'none') + '"><div><label>Max chars</label></div>',
       '<input type="number" id="va-truncate-input" min="60" max="4000" step="10" value="' + CFG.truncateChars + '" style="width:90px;"></div>',
-      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v4.1 · Live STT · Sentence-streaming TTS · Barge-in</div>',
+      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v4.3.0 · Timestamped pipeline logging · Live STT · Streaming TTS · Barge-in</div>',
     ].join('');
   }
 
@@ -612,7 +642,7 @@
       speakText('Voice playback is working.').then(function () {
         showToast('Voice: Playback test passed');
       }).catch(function (err) {
-        console.error('[VA] Playback test failed:', err);
+        console.error('[VA ' + vaTs() + '] [TEST] Playback test failed:', err);
         showToast('Voice: Playback test failed — check browser audio permission', 5000);
       }).finally(function () {
         testVoice.disabled = false;
@@ -739,7 +769,13 @@
     function PatchedES(url, config) {
       var es = new OrigES(url, config);
       var streamId = streamIdFromUrl(url);
-      if (streamId) TURN.bindStream(streamId);
+      if (streamId) {
+        TURN.bindStream(streamId);
+        if (!STREAM_SPEECH.streamId || STREAM_SPEECH.streamId !== streamId) {
+          STREAM_SPEECH.streamCreatedAt = Date.now();
+          vaDbg('SSE', 'Stream created: ' + streamId + ' (bound to open turn)');
+        }
+      }
 
       es.addEventListener('token', function (e) {
         if (!STATE.expectingReply || !streamId) return;
@@ -748,16 +784,19 @@
           var delta = String((tokenData && tokenData.text) || '');
           if (!delta) return;
           if (!TURN.bindStream(streamId)) return;
-          if (!STREAM_SPEECH.sawTokens) console.log('[VA] First token received: streamId=' + streamId + ' delta=' + delta.slice(0, 40));
+          if (!STREAM_SPEECH.sawTokens) {
+            STATE.firstTokenAt = Date.now();
+            vaDbg('SSE-TIMING', 'FIRST TOKEN ' + (STATE.sentAt ? (STATE.firstTokenAt - STATE.sentAt) + 'ms after send' : '') + ' | stream=' + streamId + ' delta="' + delta.slice(0, 40) + '"');
+          }
           armReplyWatchdog();
           acceptStreamingDelta(streamId, delta);
         } catch (err) {
-          console.warn('[VA] SSE token parse error:', err);
+          console.warn('[VA ' + vaTs() + '] [SSE] token parse error:', err);
         }
       });
 
       es.addEventListener('done', function (e) {
-        console.log('[VA] SSE done event received, streamId=' + streamId);
+        vaDbg('SSE-TIMING', 'DONE event (+' + (Date.now() - STATE.sentAt) + 'ms vs send, +' + (Date.now() - STATE.firstTokenAt) + 'ms vs first token) stream=' + streamId);
         try {
           var data = JSON.parse(e.data);
           var msgs = (data.session && data.session.messages) || [];
@@ -767,16 +806,16 @@
           }
           var text = lastAsst ? (lastAsst.content || '').trim() : '';
           text = text.replace(/ thinking[\s\S]*?<\/think>/g, '').trim();
-          console.log('[VA] SSE done: text=' + (text ? text.slice(0, 80) + '…' : '(empty)') + ' expectingReply=' + STATE.expectingReply);
+          vaDbg('SSE', 'done: text=' + (text ? text.slice(0, 80) + '…' : '(empty)') + ' expectingReply=' + STATE.expectingReply);
 
           STATE.responseText = text;
 
           if (STATE.expectingReply) {
             var accepted = TURN.noteDone(text, streamId);
-            console.log('[VA] TURN.noteDone returned: ' + accepted + ' snap=' + JSON.stringify(TURN.snapshot()));
+            vaDbg('TURN', 'noteDone returned: ' + accepted + ' snap=' + JSON.stringify(TURN.snapshot()));
           }
         } catch (err) {
-          console.warn('[VA] SSE done parse error, deferring empty completion:', err);
+          console.warn('[VA ' + vaTs() + '] [SSE] done parse error, deferring empty completion:', err);
           if (STATE.expectingReply) TURN.noteDone('', streamId);
         }
       });
@@ -789,7 +828,7 @@
     PatchedES.CLOSED = OrigES.CLOSED;
     window.EventSource = PatchedES;
 
-    console.log('[VA] EventSource hooked for response detection');
+    console.log('[VA ' + vaTs() + '] [SSE] EventSource hooked for response detection');
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -869,7 +908,7 @@
           }
         },
         onError: function (err) {
-          console.warn('[VA] Live STT unavailable; final batch STT remains active:', err);
+          console.warn('[VA ' + vaTs() + '] [STT] Live STT unavailable; final batch STT remains active:', err);
           if (!STATE.liveSttErrorShown) {
             STATE.liveSttErrorShown = true;
             showToast('Voice: Live transcript unavailable — final transcription still works', 4000);
@@ -890,10 +929,10 @@
       STATE.liveSttGain = gain;
       STATE.liveSttEncoder = encoder;
       STATE.liveStt = session;
-      console.log('[VA] Live STT PCM capture initialized at %d Hz', ctx.sampleRate);
+      vaDbg('STT', 'Live STT PCM capture initialized at ' + ctx.sampleRate + ' Hz, ws=' + liveSttUrl());
       return true;
     } catch (err) {
-      console.warn('[VA] Live STT capture init failed:', err);
+      console.warn('[VA ' + vaTs() + '] [STT] Live STT capture init failed:', err);
       return false;
     }
   }
@@ -935,10 +974,12 @@
 
   async function loadVAD() {
     if (STATE.vad) return STATE.vad;
+    var t0 = performance.now();
+    vaDbg('VAD', 'loadVAD start');
 
     var wasmOk = await testWasmEval();
     if (!wasmOk) {
-      console.error('[VA] WebAssembly blocked by CSP — Silero VAD cannot run');
+      console.error('[VA ' + vaTs() + '] [VAD] WebAssembly blocked by CSP — Silero VAD cannot run');
       showToast('Voice: WASM blocked by security policy');
       return null;
     }
@@ -949,7 +990,7 @@
     // getUserMedia would crash with "reading 'getUserMedia' of undefined".
     if (!STATE.audioStream) {
       if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
-        console.error('[VA] navigator.mediaDevices unavailable — requires localhost or HTTPS');
+        console.error('[VA ' + vaTs() + '] [VAD] navigator.mediaDevices unavailable — requires localhost or HTTPS');
         showToast('Voice: Mic needs localhost or HTTPS connection');
         return null;
       }
@@ -958,7 +999,7 @@
           audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
         });
       } catch (e) {
-        console.error('[VA] getUserMedia denied:', e);
+        console.error('[VA ' + vaTs() + '] [VAD] getUserMedia denied:', e);
         showToast('Voice: Microphone access denied');
         return null;
       }
@@ -967,6 +1008,7 @@
     try {
       var mod = await import(VAD_CDN);
       var MicVAD = mod.MicVAD;
+      vaDbg('VAD', 'Silero module code loaded (' + Math.round(performance.now() - t0) + 'ms incl. WASM/ORT init)');
 
       // ms → frames: legacy Silero model uses 1536 samples/frame @ 16kHz = 96ms.
       var framesPerMs = 1 / 96;
@@ -979,13 +1021,13 @@
         preSpeechPadFrames: Math.max(0, Math.round(CFG.preRollMs * framesPerMs)),
         redemptionFrames: Math.max(2, Math.round(CFG.endSilenceMs * framesPerMs)),
         onSpeechStart: function () {
-          console.log('[VA] Speech start');
+          vaDbg('VAD', 'Speech START (barge-in=' + (STATE.ttsActive || STATE.phase === 'speaking') + ', openCaptures=' + STATE.openSpeechCaptures + ')');
           startLiveSttUtterance();
           // Full-duplex barge-in: stop the current utterance immediately but keep
           // the conversation session alive. The captured speech becomes the next
           // natural turn (or a steer if the agent is still running).
           if (STATE.ttsActive || STATE.phase === 'speaking') {
-            console.log('[VA] Barge-in — interrupting TTS');
+            vaDbg('VAD', 'Barge-in — interrupting TTS');
             stopTTS();
             clearExpectingReply();
             TURN.reset();
@@ -1005,7 +1047,9 @@
           }
         },
         onSpeechEnd: function (audio) {
-          console.log('[VA] Speech end (%d samples)', audio ? audio.length : 0);
+          var durMs = audio && audio.length ? Math.round(audio.length / 16) : 0; // 16kHz → ms
+          vaDbg('VAD', 'Speech END (' + (audio ? audio.length : 0) + ' samples ≈ ' + durMs + 'ms)');
+          STATE.lastSpeechEndAt = Date.now();
           var sttDonePromise = finishLiveSttUtterance();
           if (STATE.openSpeechCaptures > 0) STATE.openSpeechCaptures -= 1;
           else TURN.beginStt(); // defensive: keep begin/end balanced
@@ -1015,7 +1059,7 @@
           finishWithAudio(audio, sttDonePromise);
         },
         onVADMisfire: function () {
-          console.log('[VA] VAD misfire — too short');
+          vaDbg('VAD', 'Misfire — too short, cancelling');
           cancelLiveSttUtterance();
           if (STATE.openSpeechCaptures > 0) STATE.openSpeechCaptures -= 1;
           TURN.endStt();
@@ -1024,10 +1068,10 @@
       });
 
       await ensureLiveSttCapture();
-      console.log('[VA] Silero VAD initialized');
+      vaDbg('VAD', 'Silero model + live STT ready (total ' + Math.round(performance.now() - t0) + 'ms)');
       return STATE.vad;
     } catch (e) {
-      console.error('[VA] Silero VAD init failed:', e);
+      console.error('[VA ' + vaTs() + '] [VAD] Silero VAD init failed:', e);
       showToast('Voice: Speech detection init failed');
       return null;
     }
@@ -1094,7 +1138,7 @@
       if (a > peak) peak = a;
     }
     if (peak < 0.002) {  // effectively silent clip
-      console.log('[VA] utterance too quiet, ignoring');
+      vaDbg('STT', 'utterance too quiet (peak=' + peak.toFixed(4) + '), ignoring');
       TURN.endStt();
       recoverAfterStt();
       return;
@@ -1105,6 +1149,8 @@
 
     setPhase('transcribing');
     var generation = STATE.stopGeneration;
+    var t0 = performance.now();
+    vaDbg('STT', 'Enqueued transcribe (' + blob.size + ' bytes wav, live-final-pending=' + !!sttDonePromise + ')');
 
     STT_QUEUE.add(function () {
       if (generation !== STATE.stopGeneration) return '';
@@ -1116,13 +1162,13 @@
         return sttDonePromise.then(function (liveText) {
           var clean = String(liveText || '').trim();
           if (clean.length >= 2) {
-            console.log('[VA] Live STT transcript (server-confirmed): "' + clean.slice(0, 60) + '"');
+            vaDbg('STT', 'Live STT transcript (server-confirmed) in ' + Math.round(performance.now() - t0) + 'ms: "' + clean.slice(0, 60) + '"');
             return clean;
           }
-          console.log('[VA] Live STT empty, falling back to batch');
+          vaDbg('STT-WARN', 'Live STT EMPTY (' + Math.round(performance.now() - t0) + 'ms) → batch fallback');
           return window.withVoiceTimeout(function () { return batchTranscribe(blob); }, 45000);
-        }).catch(function () {
-          console.log('[VA] Live STT failed, falling back to batch');
+        }).catch(function (err) {
+          vaDbg('STT-WARN', 'Live STT failed (' + Math.round(performance.now() - t0) + 'ms):', err ? String(err.message || err) : 'unknown');
           return window.withVoiceTimeout(function () { return batchTranscribe(blob); }, 45000);
         });
       }
@@ -1134,19 +1180,24 @@
       if (text && text.trim().length > 0) {
         sendToAgent(text.trim());
       } else {
+        vaDbg('STT-WARN', 'Transcribe returned empty text');
         recoverAfterStt();
       }
     }).catch(function (err) {
       TURN.endStt();
       if (generation !== STATE.stopGeneration) return;
-      console.error('[VA] Transcribe failed:', err);
+      console.error('[VA ' + vaTs() + '] [STT] Transcribe failed:', err);
       showToast('Voice: Transcription failed');
       recoverAfterStt();
     });
   }
 
   function batchTranscribe(blob) {
-    return transcribeAudio(blob);
+    var t0 = performance.now();
+    return transcribeAudio(blob).then(function (text) {
+      vaDbg('STT', 'Batch transcribe returned in ' + Math.round(performance.now() - t0) + 'ms: "' + String(text).slice(0, 60) + '"');
+      return text;
+    });
   }
 
   function recoverAfterStt() {
@@ -1190,8 +1241,10 @@
   function sendToAgent(text) {
     var liveStream = activeStreamId();
     var hadOpenTurn = STATE.expectingReply && TURN.snapshot().waiting;
-    console.log('[VA] sendToAgent: text="' + text.slice(0, 60) + '" liveStream=' + liveStream + ' hadOpenTurn=' + hadOpenTurn +
-      ' expectingReply=' + STATE.expectingReply + ' turnWaiting=' + TURN.snapshot().waiting);
+    var fromSpeechEnd = STATE.lastSpeechEndAt ? (Date.now() - STATE.lastSpeechEndAt) : null;
+    vaDbg('SEND', 'sendToAgent: text="' + text.slice(0, 60) + '" liveStream=' + liveStream + ' hadOpenTurn=' + hadOpenTurn +
+      ' expectingReply=' + STATE.expectingReply + ' turnWaiting=' + TURN.snapshot().waiting +
+      (fromSpeechEnd != null ? ' | ' + fromSpeechEnd + 'ms post speech-end' : ''));
     // Voice may join a turn started from the keyboard. Treat that as steerable
     // conversation too rather than letting the busy composer choose a mode.
     if (!hadOpenTurn && liveStream) {
@@ -1203,6 +1256,8 @@
     STATE.responseDone = false;
     STATE.responseText = '';
     STATE.expectingReply = true;
+    STATE.sentAt = Date.now();
+    STATE.firstTokenAt = 0;
     armReplyWatchdog();
 
     var outText = text;
@@ -1222,6 +1277,7 @@
   }
 
   function deliverNaturalFollowup(outText) {
+    var steerT0 = Date.now();
     TURN.beginDelivery();
     window.waitForVoiceSteerTarget(function () {
       var snap = TURN.snapshot();
@@ -1235,20 +1291,21 @@
       }
 
       TURN.bindStream(targetStream);
-      console.log('[VA] Active stream ready — steering conversational follow-up');
+      vaDbg('STEER', 'Active stream ready — steering follow-up (waited ' + (Date.now() - steerT0) + 'ms)');
       return _trySteer(outText, /*explicitSteer=*/false).then(function (accepted) {
         if (accepted) {
+          vaDbg('STEER', 'Steer accepted by stream ' + targetStream);
           clearVoiceComposerDraft(outText);
           resetStreamingResponse(targetStream, true);
           TURN.resolveDelivery('steer');
           setPhase('processing');
           return;
         }
-        console.log('[VA] Steer closed before delivery — continuing as next turn');
+        vaDbg('STEER-WARN', 'Steer closed before delivery — continuing as next turn');
         return startFreshFollowup(outText);
       });
     }).catch(function (err) {
-      console.warn('[VA] Natural follow-up routing failed:', err);
+      console.warn('[VA ' + vaTs() + '] [STEER] Natural follow-up routing failed:', err);
       return startFreshFollowup(outText);
     });
   }
@@ -1290,7 +1347,7 @@
   // Inject into the composer and trigger the WebUI's global send().
   function sendViaComposer(text) {
     var textarea = document.getElementById('msg');
-    if (!textarea) { console.error('[VA] No #msg textarea'); clearExpectingReply(); resetSileroMic(); return; }
+    if (!textarea) { console.error('[VA ' + vaTs() + '] [SEND] No #msg textarea'); clearExpectingReply(); resetSileroMic(); return; }
 
     textarea.value = text;
     textarea.dispatchEvent(new Event('input', { bubbles: true }));
@@ -1310,7 +1367,7 @@
     STATE.replyWatchdog = setTimeout(function () {
       STATE.replyWatchdog = null;
       if (!STATE.expectingReply || STATE.responseDone) return;
-      console.warn('[VA] Watchdog: response did not complete, recovering voice state');
+      console.warn('[VA ' + vaTs() + '] [WATCHDOG] Response did not complete in 180s, recovering voice state');
       TURN.reset();
       resetStreamingResponse('', true);
       clearExpectingReply();
@@ -1366,7 +1423,8 @@
   function queueStreamingSentence(sentence) {
     sentence = String(sentence || '').trim();
     if (!sentence) return;
-    console.log('[VA] queueStreamingSentence: "' + sentence.slice(0, 60) + '" ttsEnabled=' + CFG.ttsEnabled);
+    vaDbg('TTS', 'queueStreamingSentence: "' + sentence.slice(0, 60) + '" ttsEnabled=' + CFG.ttsEnabled +
+      ' streamDelay=' + (STREAM_SPEECH.streamCreatedAt ? (Date.now() - STREAM_SPEECH.streamCreatedAt) + 'ms' : '-'));
     if (!CFG.ttsEnabled) return;
     if (STREAM_SPEECH.playbackToken === null || !PLAYBACK.isCurrent(STREAM_SPEECH.playbackToken)) {
       STREAM_SPEECH.playbackToken = PLAYBACK.begin();
@@ -1379,12 +1437,13 @@
     var prefetchPromise = prefetchSentenceAudio(sentence, token, streamId);
 
     STREAM_SPEECH.chain = STREAM_SPEECH.chain.catch(function (err) {
-      console.warn('[VA] Streaming TTS chunk failed; continuing:', err);
+      console.warn('[VA ' + vaTs() + '] [TTS] Streaming TTS chunk failed; continuing:', err);
     }).then(function () {
       if (!PLAYBACK.isCurrent(token) || STREAM_SPEECH.streamId !== streamId) return;
       setPhase('speaking');
       return prefetchPromise.then(function (chunks) {
         if (!PLAYBACK.isCurrent(token) || STREAM_SPEECH.streamId !== streamId) return;
+        vaDbg('TTS', 'Playing sentence "' + sentence.slice(0, 40) + '" with ' + (chunks ? chunks.length : 0) + ' prefetched chunks');
         return playPrefetchedSentence(sentence, token, chunks);
       }).then(function () {
         if (!PLAYBACK.isCurrent(token) || STREAM_SPEECH.streamId !== streamId) return;
@@ -1476,7 +1535,7 @@
 
   function finalizeStreamingResponse(text) {
     text = String(text || '').trim();
-    console.log('[VA] finalizeStreamingResponse: text=' + (text ? text.slice(0, 80) + '…' : '(empty)') +
+    vaDbg('RESP', 'finalizeStreamingResponse: text=' + (text ? text.slice(0, 80) + '…' : '(empty)') +
       ' sawTokens=' + STREAM_SPEECH.sawTokens + ' ttsEnabled=' + CFG.ttsEnabled);
     if (!CFG.ttsEnabled || !text) {
       finishVoiceCycle();
@@ -1497,7 +1556,7 @@
       if (token !== null && !PLAYBACK.isCurrent(token)) return;
       finishVoiceCycle();
     }).catch(function (err) {
-      console.error('[VA] Streaming response playback failed:', err);
+      console.error('[VA ' + vaTs() + '] [TTS] Streaming response playback failed:', err);
       finishVoiceCycle();
     });
   }
@@ -1507,7 +1566,7 @@
   // ═══════════════════════════════════════════════════════════════
 
   function onAgentResponseComplete(text) {
-    console.log('[VA] onAgentResponseComplete: text=' + (text ? text.slice(0, 80) + '…' : '(empty)') + ' ttsEnabled=' + CFG.ttsEnabled);
+    vaDbg('RESP', 'onAgentResponseComplete: text=' + (text ? text.slice(0, 80) + '…' : '(empty)') + ' ttsEnabled=' + CFG.ttsEnabled);
     if (!CFG.ttsEnabled || !text.trim()) {
       clearExpectingReply();
       if (CFG.autoListen) setTimeout(nextListen, CFG.autoListenDelay);
@@ -1525,7 +1584,7 @@
       else if (STATE.vad) { try { STATE.vad.pause(); } catch (_) {} }
     }).catch(function (err) {
       if (!PLAYBACK.isCurrent(playbackToken)) return;
-      console.error('[VA] TTS failed:', err);
+      console.error('[VA ' + vaTs() + '] [TTS] TTS failed:', err);
       clearExpectingReply();
       setPhase('idle');
       if (!CFG.autoListen && STATE.vad) { try { STATE.vad.pause(); } catch (_) {} }
@@ -1599,6 +1658,7 @@
   // Prefetch a chunk's audio while previously-fetched chunks are playing.
   // (Browser engine is handled separately in speakText via SpeechSynthesis.)
   function fetchAudioBlob(text) {
+    var t0 = performance.now();
     if (CFG.ttsEngine === 'supertonic') {
       if (typeof window._hermesTtsIsRegistered !== 'function' || !window._hermesTtsIsRegistered('supertonic')) {
         return Promise.reject(new Error('Supertonic local engine is not loaded yet; reload the WebUI once'));
@@ -1609,6 +1669,7 @@
         steps: CFG.supertonicSteps,
         speed: CFG.supertonicSpeed,
       })).then(function (buffer) {
+        vaDbg('TTS-TIMING', 'Supertonic synth "' + text.slice(0, 30) + '" in ' + Math.round(performance.now() - t0) + 'ms');
         return URL.createObjectURL(new Blob([buffer], { type: 'audio/wav' }));
       });
     }
@@ -1641,11 +1702,13 @@
       if (!resp.ok) throw new Error('TTS HTTP ' + resp.status);
       return resp.blob();
     }).then(function (blob) {
+      vaDbg('TTS-TIMING', '[' + CFG.ttsEngine + '] "' + text.slice(0, 30) + '" fetch → blob ' + blob.size + ' bytes in ' + Math.round(performance.now() - t0) + 'ms');
       return URL.createObjectURL(blob);
     });
   }
 
   function playAudioURL(url, playbackToken) {
+    var pbT0 = performance.now();
     if (url === null) return Promise.resolve(true);
     if (!PLAYBACK.isCurrent(playbackToken)) {
       URL.revokeObjectURL(url);
@@ -1671,7 +1734,11 @@
         finish(false);
       }
       PLAYBACK.onCancel(cancelPlayback);
-      audio.onended = function () { finish(true); };
+      audio.onplay = function () { vaDbg('AUDIO', 'Audio playback STARTED (enqueue-to-play ' + Math.round(performance.now() - pbT0) + 'ms)'); };
+      audio.onended = function () {
+        vaDbg('AUDIO', 'Audio playback ENDED (' + Math.round(performance.now() - pbT0) + 'ms since enqueue)');
+        finish(true);
+      };
       audio.onerror = function () {
         if (settled) return;
         settled = true;
@@ -1687,7 +1754,7 @@
         if (settled) return;
         settled = true;
         cleanup();
-        console.warn('[VA] TTS play blocked:', err);
+        console.warn('[VA ' + vaTs() + '] [AUDIO] TTS play blocked:', err);
         showToast('Voice: Tap the microphone once to enable audio');
         reject(new Error('Browser blocked audio playback: ' + (err.message || err)));
       });
@@ -1848,7 +1915,7 @@
 
   // Full stop: back to idle, kill VAD + TTS.
   function stopEverything() {
-    console.log('[VA] Stopping — back to idle');
+    vaDbg('CTRL', 'Stopping — back to idle (phase was ' + STATE.phase + ')');
     if (STATE.vad) { try { STATE.vad.pause(); } catch (_) {} }
     stopTTS();
     closeLiveSttCapture();
@@ -1915,7 +1982,7 @@
     } catch (_) {}
   }
 
-  function init() {
+  async function init() {
     loadSettings();
     injectUI();
     ensurePlaybackAudio();
@@ -1926,7 +1993,10 @@
     hookSSE();
     checkCapabilities();
     testWasmEval();
-    console.log('[VA] Voice Assistant v4.1 loaded — live partial STT + sentence-streaming TTS + barge-in');
+    vaDbg('BOOT', 'Voice Assistant v4.3.0 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
+      stt: CFG.streamingSttEnabled, tts: CFG.ttsEngine, voice: CFG.ttsVoice,
+      crisp: CFG.crispPrompt, truncate: CFG.truncateEnabled, autoListen: CFG.autoListen,
+    }));
   }
 
   if (document.readyState === 'loading') {

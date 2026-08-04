@@ -10,6 +10,16 @@
 })(typeof window !== 'undefined' ? window : globalThis, function () {
   'use strict';
 
+  // Reuse the pipeline's timestamped logger when present (browser), else a
+  // silent no-op so Node unit tests never emit console noise.
+  var dbg = (typeof window !== 'undefined' && typeof window.vaDbg === 'function')
+    ? function (tag, msg) { window.vaDbg('WLK-' + tag, msg); }
+    : function () {};
+  var STT_T0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+  function elapsed() {
+    return Math.round(((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - STT_T0);
+  }
+
   function toBytes(value) {
     if (!value) return new Uint8Array(0);
     if (value instanceof Uint8Array) return value;
@@ -148,17 +158,20 @@
     this.lastTranscript = '';
     this._finishResolve = null;
     this._finishTimeout = null;
+    dbg('WS', 'start: new utterance, url=' + String(this.url).replace(/\?.*$/, ''));
     var initial = this.ring.drain();
     var explicit = toBytes(preRoll);
     this.pending = [];
     if (initial.byteLength || explicit.byteLength) this.pending.push(concatBytes([initial, explicit]));
 
     var self = this;
+    this._t0 = elapsed();
     var ws = new this.WebSocketImpl(this.url);
     this.socket = ws;
     ws.binaryType = 'arraybuffer';
     ws.onopen = function () {
       if (self.socket !== ws || !self.active) return;
+      dbg('WS', 'open (+' + (elapsed() - self._t0) + 'ms since start); flushing ' + self.pending.length + ' pending chunk(s)');
       while (self.pending.length) ws.send(self.pending.shift());
       if (self.finishing) ws.send(new Uint8Array(0));
     };
@@ -170,6 +183,7 @@
           // The ready_to_stop message may carry the final flushed transcript
           // (lines + buffer_transcription). Parse it before resolving.
           var finalText = transcriptFromWlkMessage(msg);
+          dbg('WS', 'ready_to_stop (+' + (elapsed() - self._t0) + 'ms) finalText="' + finalText.slice(0, 60) + '" (len=' + finalText.length + ', prevLen=' + self.lastTranscript.length + ')');
           if (finalText && finalText.length > self.lastTranscript.length) {
             self.lastTranscript = finalText;
           }
@@ -183,18 +197,22 @@
           self.close();
           return;
         }
-        if (msg && msg.type === 'config') return;
+        if (msg && msg.type === 'config') { dbg('WS', 'config received'); return; }
         var text = transcriptFromWlkMessage(msg);
         if (text && text !== self.lastTranscript) {
           self.lastTranscript = text;
+          dbg('TX', 'partial "' + text.slice(0, 60) + '" (+' + (elapsed() - self._t0) + 'ms)');
           self.onTranscript(text, msg);
         }
       } catch (err) {
         self.onError(err);
       }
     };
-    ws.onerror = function () {
-      if (self.socket === ws) self.onError(new Error('live STT connection failed'));
+    ws.onerror = function (ev) {
+      if (self.socket === ws) {
+        dbg('WS-ERR', 'connection error (+' + (elapsed() - self._t0) + 'ms)');
+        self.onError(new Error('live STT connection failed'));
+      }
     };
     return true;
   };
@@ -204,12 +222,14 @@
     if (this.finishing) return Promise.resolve(this.lastTranscript);
     this.finishing = true;
     var self = this;
+    this._finishT0 = elapsed();
     return new Promise(function (resolve) {
       self._finishResolve = resolve;
       self._finishTimeout = setTimeout(function () {
         if (self._finishResolve === resolve) {
           self._finishResolve = null;
           self._finishTimeout = null;
+          dbg('WS-TIMEOUT', 'finish TIMED OUT after 3000ms — resolving with lastTranscript="' + String(self.lastTranscript).slice(0, 60) + '" (len=' + self.lastTranscript.length + ')');
           resolve(self.lastTranscript);
         }
       }, 3000);
@@ -225,6 +245,7 @@
       var resolve = this._finishResolve;
       this._finishResolve = null;
       if (this._finishTimeout) { clearTimeout(this._finishTimeout); this._finishTimeout = null; }
+      dbg('WS', 'close: resolving finish with lastTranscript="' + String(this.lastTranscript).slice(0, 60) + '" (len=' + this.lastTranscript.length + ')');
       resolve(this.lastTranscript);
     }
     this.socket = null;
