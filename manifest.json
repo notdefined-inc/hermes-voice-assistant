@@ -6,7 +6,12 @@
       "description": "Live partial STT, sentence-streaming TTS, guarded final STT, steering, and barge-in",
       "enabled": true,
       "scripts": ["assets/voice-turn-coordinator.js", "assets/streaming-voice-pipeline.js", "assets/live-stt-client.js", "assets/elevenlabs-live-stt-client.js", "assets/voice-assistant.js"],
-      "stylesheets": ["assets/voice-assistant.css"]
+      "stylesheets": ["assets/voice-assistant.css"],
+      "sidecar": {
+        "type": "loopback",
+        "origin": "http://127.0.0.1:7789",
+        "health_path": "/health"
+      }
     }
   ]
 }

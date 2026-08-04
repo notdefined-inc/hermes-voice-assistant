@@ -1248,7 +1248,7 @@
     if (CFG.sttProvider === 'elevenlabs' && window.ElevenLabsLiveSession) {
       var elLang = CFG.streamingSttLanguage === 'auto' ? '' : CFG.streamingSttLanguage;
       return new window.ElevenLabsLiveSession({
-        tokenUrl: '/api/stt/elevenlabs-token',
+        tokenUrl: '/api/extensions/voice-assistant/sidecar/v1/elevenlabs-token',
         language: elLang,
         preRollBytes: Math.max(16000, Math.round(16000 * 2 * CFG.preRollMs / 1000)),
         onTranscript: function (text) {
@@ -2198,8 +2198,17 @@
     }
     if (voice) body.voice = voice;
     if (CFG.ttsRate) body.rate = CFG.ttsRate;
+    // Supertonic routes through the extension sidecar proxy (no WebUI source patch).
+    // All other engines use /api/tts as before.
+    var ttsUrl = '/api/tts';
+    if (CFG.ttsEngine === 'supertonic-server') {
+      ttsUrl = '/api/extensions/voice-assistant/sidecar/v1/tts';
+      // Sidecar forwards body verbatim to the Supertonic server at :7788.
+      // Strip the 'engine' field since the sidecar handler is Supertonic-only.
+      delete body.engine;
+    }
     var doFetch = function () {
-      return fetch('/api/tts', {
+      return fetch(ttsUrl, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
       });
     };
