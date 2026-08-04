@@ -907,8 +907,7 @@
   }
 
   function finishLiveSttUtterance() {
-    // finish() is now called inside finishWithAudio via the live STT path.
-    // This is a no-op stub kept for backward compatibility.
+    if (STATE.liveStt) STATE.liveStt.finish();
   }
 
   function cancelLiveSttUtterance() {
@@ -1106,33 +1105,25 @@
     setPhase('transcribing');
     var generation = STATE.stopGeneration;
 
-    // Try live STT transcript first — if WhisperLiveKit already has the text,
-    // skip the batch re-transcribe entirely (saves 500-2000ms on 2 vCPU).
-    var livePromise = null;
-    if (CFG.streamingSttEnabled && STATE.liveStt && STATE.liveStt.active) {
-      livePromise = STATE.liveStt.finish().then(function (text) {
-        var clean = String(text || '').trim();
-        if (clean.length >= 2) {
-          console.log('[VA] Live STT transcript accepted: "' + clean.slice(0, 60) + '"');
-          return clean;
-        }
-        console.log('[VA] Live STT empty, falling back to batch');
-        return null;
-      }).catch(function () { return null; });
+    // Read the live STT transcript synchronously. By the time Silero fires
+    // onSpeechEnd (after 650-850ms of silence), the localagreement policy has
+    // already committed the text. No need to await finish() — just read it.
+    var liveText = null;
+    if (CFG.streamingSttEnabled && STATE.liveStt) {
+      liveText = String(STATE.liveStt.lastTranscript || '').trim();
+      if (liveText.length >= 2) {
+        console.log('[VA] Live STT transcript accepted: "' + liveText.slice(0, 60) + '"');
+      } else {
+        console.log('[VA] Live STT empty, will fall back to batch');
+        liveText = null;
+      }
     }
 
     STT_QUEUE.add(function () {
       if (generation !== STATE.stopGeneration) return '';
-      return window.withVoiceTimeout(function () {
-        // If live STT gave us text, skip batch entirely
-        if (livePromise) {
-          return livePromise.then(function (liveText) {
-            if (liveText) return liveText;
-            return batchTranscribe(blob);
-          });
-        }
-        return batchTranscribe(blob);
-      }, 45000);
+      // If we already have the live transcript, skip batch entirely
+      if (liveText) return Promise.resolve(liveText);
+      return window.withVoiceTimeout(function () { return batchTranscribe(blob); }, 45000);
     }).then(function (text) {
       TURN.endStt();
       if (generation !== STATE.stopGeneration) return;

@@ -213,12 +213,18 @@
 
   LiveSttSession.prototype.close = function () {
     var ws = this.socket;
+    // Resolve any pending finish() promise before tearing down,
+    // otherwise the caller's await hangs until the outer timeout.
+    if (this._finishResolve) {
+      var resolve = this._finishResolve;
+      this._finishResolve = null;
+      if (this._finishTimeout) { clearTimeout(this._finishTimeout); this._finishTimeout = null; }
+      resolve(this.lastTranscript);
+    }
     this.socket = null;
     this.active = false;
     this.finishing = false;
     this.pending = [];
-    if (this._finishTimeout) { clearTimeout(this._finishTimeout); this._finishTimeout = null; }
-    this._finishResolve = null;
     if (ws && ws.readyState < 2 && typeof ws.close === 'function') {
       try { ws.close(); } catch (_) {}
     }
