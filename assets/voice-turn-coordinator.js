@@ -209,7 +209,7 @@
     if (out.preRollMs === 300 && out.minSpeechMs === 400 && out.endSilenceMs === 650) {
       out.preRollMs = 500;
       out.minSpeechMs = 300;
-      out.endSilenceMs = 850;
+      out.endSilenceMs = 1200;
     }
     return out;
   }

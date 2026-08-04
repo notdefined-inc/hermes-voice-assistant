@@ -70,7 +70,7 @@ function testFailedOrEmptySttReleasesDeferredFirstAnswer() {
 function testCaptureMigrationAddsBoundaryPaddingWithoutOverwritingCustomValues() {
   assert.deepEqual(
     migrateCaptureSettings({ preRollMs: 300, minSpeechMs: 400, endSilenceMs: 650 }),
-    { preRollMs: 500, minSpeechMs: 300, endSilenceMs: 850 }
+    { preRollMs: 500, minSpeechMs: 300, endSilenceMs: 1200 }
   );
   assert.deepEqual(
     migrateCaptureSettings({ preRollMs: 700, minSpeechMs: 500, endSilenceMs: 1200 }),

@@ -62,9 +62,9 @@
     // preRollMs = audio buffered before speech is confirmed (fixes cut-off starts)
     // minSpeechMs = how long speech must persist before being accepted (misfire guard)
     // endSilenceMs = trailing silence that ends the utterance
-    preRollMs: 300,
-    minSpeechMs: 400,
-    endSilenceMs: 650,
+    preRollMs: 500,
+    minSpeechMs: 300,
+    endSilenceMs: 1200,
 
     // Crisp Replies: append a directive to the outgoing message so the AGENT
     // itself answers short and direct. The full answer reflects this — it's
@@ -1400,6 +1400,9 @@
   function serializedTtsFetch(text, token, streamId) {
     var run = TTS_FETCH_CHAIN.then(function () {
       return fetchAudioBlob(text);
+    }).then(function (url) {
+      // Small gap between consecutive TTS requests to avoid 429 rate limiting
+      return new Promise(function (resolve) { setTimeout(function () { resolve(url); }, 200); });
     });
     // Keep the chain alive even if this fetch fails
     TTS_FETCH_CHAIN = run.then(function () {}, function () {});
