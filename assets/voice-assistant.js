@@ -1430,14 +1430,14 @@
     // Serialize fetches: chain them so only one TTS request is in-flight
     var result = Promise.resolve([]);
     for (var i = 0; i < chunks.length; i++) {
-      result = result.then(function (acc, chunk) {
-        return function () {
+      (function (chunk) {
+        result = result.then(function (acc) {
           return serializedTtsFetch(chunk, token, streamId).then(function (item) {
             if (item) acc.push(item);
             return acc;
           });
-        };
-      }(result, chunks[i]));
+        });
+      })(chunks[i]);
     }
     return result;
   }
