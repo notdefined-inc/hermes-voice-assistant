@@ -24,6 +24,16 @@
     return Math.round(((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - STT_T0);
   }
 
+  // How long finish() waits for the server's ready_to_stop (the authoritative
+  // "done + final text" signal from WhisperLiveKit). WLK streams partial
+  // transcripts and only emits ready_to_stop after its internal
+  // agreement/settlement window, which on a busy VPS can take 6-30s. Every ms
+  // here is one innocent transcript not wasted to the slow (and lossy) batch
+  // fallback. The caller's outer withVoiceTimeout(45s) still bounds the worst
+  // case. Tune per-VPS: this is the single highest-leverage knob for
+  // "live STT empty → 20s batch fallback".
+  var FINISH_TIMEOUT_MS = 20000;
+
   function toBytes(value) {
     if (!value) return new Uint8Array(0);
     if (value instanceof Uint8Array) return value;
@@ -226,6 +236,7 @@
     if (this.finishing) return Promise.resolve(this.lastTranscript);
     this.finishing = true;
     var self = this;
+    var timeoutMs = this.finishTimeoutMs || FINISH_TIMEOUT_MS;
     this._finishT0 = elapsed();
     return new Promise(function (resolve) {
       self._finishResolve = resolve;
@@ -233,10 +244,10 @@
         if (self._finishResolve === resolve) {
           self._finishResolve = null;
           self._finishTimeout = null;
-          dbg('WS-TIMEOUT', 'finish TIMED OUT after 3000ms — resolving with lastTranscript="' + String(self.lastTranscript).slice(0, 60) + '" (len=' + self.lastTranscript.length + ')');
+          dbg('WS-TIMEOUT', 'finish TIMED OUT after ' + timeoutMs + 'ms — resolving with lastTranscript="' + String(self.lastTranscript).slice(0, 60) + '" (len=' + self.lastTranscript.length + ')');
           resolve(self.lastTranscript);
         }
-      }, 3000);
+      }, timeoutMs);
       if (self.socket && self.socket.readyState === 1) self.socket.send(new Uint8Array(0));
     });
   };
