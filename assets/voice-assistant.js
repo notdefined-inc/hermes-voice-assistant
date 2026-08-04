@@ -137,22 +137,22 @@
     //   live — live WLK first; fall back to batch only if it confirms empty.
     //   batch — skip live STT entirely; always use authoritative batch (most
     //     accurate, slower, no partial transcript display).
-    sttMode: 'hybrid',
+    sttMode: 'batch',
     // Hybrid grace window: how long to let live STT prove itself before the
     // batch transcription joins the race (ms).
     raceGraceMs: 2500,
     streamingSttSecure: true,
-    streamingSttLanguage: 'auto',
+    streamingSttLanguage: 'en',
 
     ttsEnabled: true,
-    ttsEngine: 'edge',       // edge | openai | elevenlabs | browser | supertonic-server | supertonic
+    ttsEngine: 'edge',       // edge | openai | elevenlabs | browser | supertonic-server
     ttsRate: '',
     ttsChunkSize: 500,
     // Per-engine voice profiles. ttsVoice is the Edge name (allowlisted by the
     // server); elevenlabsVoice is the ElevenLabs voice_id; openaiVoice is the
-    // OpenAI voice name. Supertonic has its own voice/language/quality controls.
-    // NOTE: ElevenLabs default = Adam (pNInz6obpgDQGcFmaJgB), a FREE creator
-    // voice. Library voices (e.g. m3yAHyFEFKtbCIM5n7GF) require a paid plan.
+    // OpenAI voice name. Supertonic-server has its own voice/language/quality
+    // controls. NOTE: ElevenLabs default = Adam (pNInz6obpgDQGcFmaJgB), a FREE
+    // creator voice. Library voices (e.g. m3yAHyFEFKtbCIM5n7GF) require a paid plan.
     ttsVoice: 'en-GB-SoniaNeural',
     elevenlabsVoice: 'pNInz6obpgDQGcFmaJgB',
     openaiVoice: 'alloy',
@@ -161,6 +161,19 @@
     supertonicSteps: 5,
     supertonicSpeed: 1.05,
     supertonicServerMigrationDone: false,
+
+    // Batch transcription provider override sent to /api/transcribe.
+    //   auto       — server auto-detects (config stt.provider, else local > groq > openai …)
+    //   local      — faster-whisper (local, free)
+    //   groq       — Groq Whisper API (free tier)
+    //   openai     — OpenAI Whisper API
+    //   mistral    — Mistral Voxtral API
+    //   xai        — xAI Grok STT API
+    //   elevenlabs — ElevenLabs Scribe API
+    //   deepinfra  — DeepInfra Whisper API
+    // Engine availability is checked server-side; a missing API key returns a
+    // clear 503 "not configured" error instead of silently falling back.
+    sttProvider: 'auto',
 
     // Speech detection (Silero VAD) — configurable timing. All in milliseconds.
     // preRollMs = audio buffered before speech is confirmed (fixes cut-off starts)
@@ -333,7 +346,9 @@
         autoListen: CFG.autoListen,
         ttsEnabled: CFG.ttsEnabled,
         sttMode: CFG.sttMode,
+        sttProvider: CFG.sttProvider,
         raceGraceMs: CFG.raceGraceMs,
+        streamingSttLanguage: CFG.streamingSttLanguage,
         ttsVoice: CFG.ttsVoice,
         ttsEngine: CFG.ttsEngine,
         elevenlabsVoice: CFG.elevenlabsVoice,
@@ -479,6 +494,24 @@
         '<option value="live"' + (CFG.sttMode === 'live' ? ' selected' : '') + '>Live streaming</option>',
         '<option value="batch"' + (CFG.sttMode === 'batch' ? ' selected' : '') + '>Batch (accurate)</option>',
       '</select></div>',
+      '<div class="va-setting-row"><div><label>STT Provider</label><div class="va-hint" id="va-stt-provider-hint">Batch transcription backend</div></div>',
+      '<select id="va-stt-provider-select">',
+        '<option value="auto"' + (CFG.sttProvider === 'auto' ? ' selected' : '') + '>Auto (server)</option>',
+        '<option value="local"' + (CFG.sttProvider === 'local' ? ' selected' : '') + '>Local (free)</option>',
+        '<option value="groq"' + (CFG.sttProvider === 'groq' ? ' selected' : '') + '>Groq</option>',
+        '<option value="openai"' + (CFG.sttProvider === 'openai' ? ' selected' : '') + '>OpenAI</option>',
+        '<option value="mistral"' + (CFG.sttProvider === 'mistral' ? ' selected' : '') + '>Mistral</option>',
+        '<option value="xai"' + (CFG.sttProvider === 'xai' ? ' selected' : '') + '>xAI</option>',
+        '<option value="elevenlabs"' + (CFG.sttProvider === 'elevenlabs' ? ' selected' : '') + '>ElevenLabs</option>',
+        '<option value="deepinfra"' + (CFG.sttProvider === 'deepinfra' ? ' selected' : '') + '>DeepInfra</option>',
+      '</select></div>',
+      '<div class="va-setting-row"><div><label>STT Language</label><div class="va-hint">Language for transcription</div></div>',
+      '<select id="va-stt-lang-select">',
+        '<option value="en"' + (CFG.streamingSttLanguage === 'en' ? ' selected' : '') + '>English</option>',
+        '<option value="auto"' + (CFG.streamingSttLanguage === 'auto' ? ' selected' : '') + '>Auto-detect</option>',
+        '<option value="hi"' + (CFG.streamingSttLanguage === 'hi' ? ' selected' : '') + '>Hindi</option>',
+        '<option value="ur"' + (CFG.streamingSttLanguage === 'ur' ? ' selected' : '') + '>Urdu</option>',
+      '</select></div>',
       '<div class="va-setting-row" id="va-racegrace-row" style="display:' + (CFG.sttMode === 'hybrid' ? 'flex' : 'none') + '"><div><label>Race grace</label><div class="va-hint">Live STT prove-it window; batch joins after</div></div>',
       '<div class="va-slider-row"><input type="range" min="500" max="8000" step="250" value="' + CFG.raceGraceMs + '" id="va-racegrace-slider">',
       '<span class="va-slider-val" id="va-racegrace-val">' + CFG.raceGraceMs + 'ms</span></div></div>',
@@ -492,27 +525,26 @@
         '<option value="openai"' + (CFG.ttsEngine === 'openai' ? ' selected' : '') + '>OpenAI</option>',
         '<option value="elevenlabs"' + (CFG.ttsEngine === 'elevenlabs' ? ' selected' : '') + '>ElevenLabs</option>',
         '<option value="browser"' + (CFG.ttsEngine === 'browser' ? ' selected' : '') + '>Browser (client)</option>',
-        '<option value="supertonic-server"' + (CFG.ttsEngine === 'supertonic-server' ? ' selected' : '') + '>Supertonic 3 (server · recommended)</option>',
-        '<option value="supertonic"' + (CFG.ttsEngine === 'supertonic' ? ' selected' : '') + '>Supertonic 3 (browser · 400 MB)</option>',
+        '<option value="supertonic-server"' + (CFG.ttsEngine === 'supertonic-server' ? ' selected' : '') + '>Supertonic 3 (server)</option>',
       '</select></div>',
       '<div class="va-setting-row"><div><label>Voice</label><div class="va-hint" id="va-voice-hint">Choose a voice for the selected engine</div></div>',
       '<div id="va-voice-control">' + voiceControlHTML() + '</div></div>',
       '<div class="va-setting-row"><div><label>Playback check</label><div class="va-hint">Tap once on mobile to unlock and test audio</div></div>',
       '<button type="button" id="va-test-voice">Test voice</button></div>',
-      '<div class="va-setting-row" id="va-supertonic-options" style="display:' + ((CFG.ttsEngine === 'supertonic' || CFG.ttsEngine === 'supertonic-server') ? 'flex' : 'none') + '"><div><label>Language</label><div class="va-hint">Auto/mixed is best for Hinglish</div></div>',
+      '<div class="va-setting-row" id="va-supertonic-options" style="display:' + (CFG.ttsEngine === 'supertonic-server' ? 'flex' : 'none') + '"><div><label>Language</label><div class="va-hint">Auto/mixed is best for Hinglish</div></div>',
       '<select id="va-supertonic-lang-select">',
         '<option value="na"' + (CFG.supertonicLang === 'na' ? ' selected' : '') + '>Auto / mixed (na)</option>',
         '<option value="en"' + (CFG.supertonicLang === 'en' ? ' selected' : '') + '>English</option>',
         '<option value="hi"' + (CFG.supertonicLang === 'hi' ? ' selected' : '') + '>Hindi</option>',
       '</select></div>',
-      '<div class="va-setting-row" id="va-supertonic-quality" style="display:' + ((CFG.ttsEngine === 'supertonic' || CFG.ttsEngine === 'supertonic-server') ? 'flex' : 'none') + '"><div><label>Quality</label><div class="va-hint">More steps sound better but take longer</div></div>',
+      '<div class="va-setting-row" id="va-supertonic-quality" style="display:' + (CFG.ttsEngine === 'supertonic-server' ? 'flex' : 'none') + '"><div><label>Quality</label><div class="va-hint">More steps sound better but take longer</div></div>',
       '<select id="va-supertonic-steps-select">',
         '<option value="5"' + (CFG.supertonicSteps === 5 ? ' selected' : '') + '>Fast (5)</option>',
         '<option value="8"' + (CFG.supertonicSteps === 8 ? ' selected' : '') + '>Balanced (8)</option>',
         '<option value="10"' + (CFG.supertonicSteps === 10 ? ' selected' : '') + '>High (10)</option>',
         '<option value="12"' + (CFG.supertonicSteps === 12 ? ' selected' : '') + '>Very high (12)</option>',
       '</select></div>',
-      '<div class="va-setting-row" id="va-supertonic-speed" style="display:' + ((CFG.ttsEngine === 'supertonic' || CFG.ttsEngine === 'supertonic-server') ? 'flex' : 'none') + '"><div><label>Speed</label><div class="va-hint">Recommended range: 0.9–1.5</div></div>',
+      '<div class="va-setting-row" id="va-supertonic-speed" style="display:' + (CFG.ttsEngine === 'supertonic-server' ? 'flex' : 'none') + '"><div><label>Speed</label><div class="va-hint">Recommended range: 0.9–1.5</div></div>',
       '<div class="va-slider-row"><input type="range" min="0.7" max="2" step="0.05" value="' + CFG.supertonicSpeed + '" id="va-supertonic-speed-slider">',
       '<span class="va-slider-val" id="va-supertonic-speed-val">' + Number(CFG.supertonicSpeed).toFixed(2) + '×</span></div></div>',
       '<div class="va-setting-row"><div><label>Start Pre-roll</label><div class="va-hint">Audio kept before speech is confirmed (fixes cut-off starts)</div></div>',
@@ -530,7 +562,7 @@
       '<div class="va-toggle' + (CFG.truncateEnabled ? ' va-on' : '') + '" id="va-truncate-toggle"><div class="va-toggle-knob"></div></div></div>',
       '<div class="va-setting-row" id="va-truncate-row" style="display:' + (CFG.truncateEnabled ? 'flex' : 'none') + '"><div><label>Max chars</label></div>',
       '<input type="number" id="va-truncate-input" min="60" max="4000" step="10" value="' + CFG.truncateChars + '" style="width:90px;"></div>',
-      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v5.0 · Per-utterance live STT · Streaming TTS · Barge-in</div>',
+      '<div style="font-size:11px;opacity:0.4;margin-top:12px;text-align:center;">v5.1 · Per-utterance live STT · Streaming TTS · Multi-engine STT/TTS</div>',
     ].join('');
   }
 
@@ -567,7 +599,7 @@
     if (CFG.ttsEngine === 'browser') {
       return '<input type="text" id="va-voice-input" value="' + (CFG.ttsVoice || '') + '" placeholder="e.g. en-GB, or voice name" style="width:180px;" spellcheck="false">';
     }
-    if (CFG.ttsEngine === 'supertonic' || CFG.ttsEngine === 'supertonic-server') {
+    if (CFG.ttsEngine === 'supertonic-server') {
       var supertonicVoices = [
         ['M1', 'Male 1'], ['M2', 'Male 2'], ['M3', 'Male 3'], ['M4', 'Male 4'], ['M5', 'Male 5'],
         ['F1', 'Female 1'], ['F2', 'Female 2'], ['F3', 'Female 3'], ['F4', 'Female 4'], ['F5', 'Female 5']
@@ -599,15 +631,12 @@
       else if (CFG.ttsEngine === 'openai') hint.textContent = 'Choose an OpenAI voice name';
       else if (CFG.ttsEngine === 'browser') hint.textContent = 'Lang tag (e.g. en-GB) or OS voice name';
       else if (CFG.ttsEngine === 'supertonic-server') hint.textContent = 'Server-side Supertonic voice style (M1–M5 / F1–F5)';
-      else if (CFG.ttsEngine === 'supertonic') hint.textContent = 'Browser-side Supertonic voice style (M1–M5 / F1–F5)';
       else hint.textContent = 'Choose an Edge (Microsoft) neural voice';
     }
     var engineHint = document.getElementById('va-engine-hint');
     if (engineHint) engineHint.textContent = CFG.ttsEngine === 'supertonic-server'
       ? 'Runs on the VPS; clients download only generated WAV audio'
-      : (CFG.ttsEngine === 'supertonic'
-        ? 'Optional browser mode; downloads about 400 MB and may fail on mobile'
-        : (CFG.ttsEngine === 'edge' ? 'Edge = free, no key' : 'The selected engine may need a server API key'));
+      : (CFG.ttsEngine === 'edge' ? 'Edge = free, no key' : 'The selected engine may need a server API key');
     refreshSupertonicOptions();
     wireVoiceControl();
   }
@@ -631,7 +660,7 @@
             CFG.elevenlabsVoice = sel.value;
             saveSettings();
           }
-        } else if (CFG.ttsEngine === 'supertonic' || CFG.ttsEngine === 'supertonic-server') {
+        } else if (CFG.ttsEngine === 'supertonic-server') {
           CFG.supertonicVoice = sel.value;
           saveSettings();
         }
@@ -650,7 +679,7 @@
   }
 
   function refreshSupertonicOptions() {
-    var visible = CFG.ttsEngine === 'supertonic' || CFG.ttsEngine === 'supertonic-server';
+    var visible = CFG.ttsEngine === 'supertonic-server';
     ['va-supertonic-options', 'va-supertonic-quality', 'va-supertonic-speed'].forEach(function (id) {
       var row = document.getElementById(id);
       if (row) row.style.display = visible ? 'flex' : 'none';
@@ -716,6 +745,28 @@
       // don't pay a connection that can never win. Re-enabling hybrid/live
       // recreates it lazily on next listen.
       if (CFG.sttMode === 'batch') closeLiveSttCapture();
+      saveSettings();
+    });
+
+    // STT Language selector — en / auto / hi / ur.
+    var sttLang = document.getElementById('va-stt-lang-select');
+    if (sttLang) sttLang.addEventListener('change', function () {
+      CFG.streamingSttLanguage = sttLang.value;
+      saveSettings();
+    });
+
+    // STT Provider selector — batch transcription backend (auto / local / groq /
+    // openai / mistral / xai / elevenlabs / deepinfra). The choice is forwarded
+    // to /api/transcribe, which resolves availability server-side.
+    var sttProvider = document.getElementById('va-stt-provider-select');
+    if (sttProvider) sttProvider.addEventListener('change', function () {
+      CFG.sttProvider = sttProvider.value;
+      var hint = document.getElementById('va-stt-provider-hint');
+      if (hint) {
+        if (CFG.sttProvider === 'auto') hint.textContent = 'Server picks: config stt.provider, else local > cloud';
+        else if (CFG.sttProvider === 'local') hint.textContent = 'faster-whisper on this machine — free, offline';
+        else hint.textContent = 'Requires the matching API key on the server';
+      }
       saveSettings();
     });
 
@@ -1607,6 +1658,8 @@
     var formData = new FormData();
     var ext = blob.type.includes('wav') ? '.wav' : (blob.type.includes('webm') ? '.webm' : '.ogg');
     formData.append('file', blob, 'voice' + ext);
+    // Forward the user-selected STT provider (auto = server default).
+    if (CFG.sttProvider && CFG.sttProvider !== 'auto') formData.append('provider', CFG.sttProvider);
     var resp = await fetch('/api/transcribe', { method: 'POST', body: formData });
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     var data = await resp.json();
@@ -2092,20 +2145,6 @@
   // (Browser engine is handled separately in speakText via SpeechSynthesis.)
   function fetchAudioBlob(text) {
     var t0 = performance.now();
-    if (CFG.ttsEngine === 'supertonic') {
-      if (typeof window._hermesTtsIsRegistered !== 'function' || !window._hermesTtsIsRegistered('supertonic')) {
-        return Promise.reject(new Error('Supertonic local engine is not loaded yet; reload the WebUI once'));
-      }
-      return Promise.resolve(window._hermesTtsSynth('supertonic', text, {
-        voice: CFG.supertonicVoice,
-        lang: CFG.supertonicLang,
-        steps: CFG.supertonicSteps,
-        speed: CFG.supertonicSpeed,
-      })).then(function (buffer) {
-        vaDbg('TTS-TIMING', 'Supertonic synth "' + text.slice(0, 30) + '" in ' + Math.round(performance.now() - t0) + 'ms');
-        return URL.createObjectURL(new Blob([buffer], { type: 'audio/wav' }));
-      });
-    }
     var body = { text: text, engine: CFG.ttsEngine };
     // Send the engine-appropriate voice:
     //  - edge               → Edge neural voice name (server allowlist)
@@ -2241,13 +2280,21 @@
     STATE.ttsActive = false;
   }
 
-  // Sequential browser-engine speech via SpeechSynthesis. A token promise
-  // resolves when the last queued utterance ends, giving gapless queueing
-  // that still respects stopTTS() (which calls speechSynthesis.cancel()).
+  // Sequential browser-engine speech via SpeechSynthesis. Each chunk is
+  // spoken one at a time and only advances after its own onend/onerror, so
+  // failures cannot wedge the queue. Robustness fixes for known browser bugs:
+  //   - Chrome loads voices ASYNC (getVoices() is empty until 'voiceschanged'
+  //     fires) — we wait for the event before matching, with a fallback timer.
+  //   - Chrome silently pauses speechSynthesis after idle / cancel() — we
+  //     call resume() immediately before every speak().
+  //   - Voice matching now prefers: exact name/voiceURI → exact lang (en-GB)
+  //     → base lang (en), so an Edge-style name like 'en-GB-SoniaNeural' still
+  //     resolves to the best available OS voice for that locale.
   function speakBrowserChunks(chunks, playbackToken) {
     return new Promise(function (resolve) {
       if (!chunks.length) { resolve(); return; }
       if (!('speechSynthesis' in window)) { resolve(); return; }
+      var synth = window.speechSynthesis;
 
       var finished = false;
       function done() {
@@ -2259,37 +2306,67 @@
         }
       }
       function cancelBrowserSpeech() {
-        try { window.speechSynthesis.cancel(); } catch (_) {}
+        try { synth.cancel(); } catch (_) {}
         done();
       }
       PLAYBACK.onCancel(cancelBrowserSpeech);
 
-      for (var i = 0; i < chunks.length; i++) {
-        if (!STATE.ttsActive || !PLAYBACK.isCurrent(playbackToken)) { done(); return; }
-        var utter = new SpeechSynthesisUtterance(chunks[i]);
-        var voices = window.speechSynthesis.getVoices();
-        if (CFG.ttsVoice && voices.length) {
-          var wantLang = CFG.ttsVoice.split('-').slice(0, 2).join('-');
-          var match = null;
-          for (var v = 0; v < voices.length; v++) {
-            if (voices[v].name === CFG.ttsVoice || voices[v].voiceURI.indexOf(CFG.ttsVoice) >= 0 || voices[v].lang === wantLang) { match = voices[v]; break; }
-          }
-          if (match) utter.voice = match;
-          else if (voices.some(function (vv) { return vv.lang === wantLang; })) {
-            utter.lang = wantLang;  // browser picks best available in this locale
-          }
+      var voices = [];
+      function loadVoices() {
+        try { voices = synth.getVoices() || []; } catch (_) { voices = []; }
+      }
+      loadVoices();
+
+      function pickVoice() {
+        if (!CFG.ttsVoice || !voices.length) return null;
+        var want = String(CFG.ttsVoice).toLowerCase();
+        var wantLang = want.split('-').slice(0, 2).join('-'); // en-gb
+        var wantBase = want.split('-')[0];                    // en
+        var exact = null, lang = null, base = null;
+        for (var i = 0; i < voices.length; i++) {
+          var v = voices[i];
+          var vlang = String(v.lang || '').toLowerCase();
+          var vname = String(v.name || '').toLowerCase();
+          if (vname === want || (v.voiceURI && String(v.voiceURI).toLowerCase().indexOf(want) >= 0)) {
+            exact = v; break;
+          } else if (vlang === wantLang && !lang) lang = v;
+          else if (vlang.split('-')[0] === wantBase && !base) base = v;
         }
-        if (CFG.ttsRate) { var r = parseFloat(CFG.ttsRate); if (!isNaN(r) && r > -50) utter.rate = 1 + r / 100; }
-        utter.onend = (i === chunks.length - 1) ? done : null;
-        utter.onerror = (i === chunks.length - 1) ? done : null;
-        window.speechSynthesis.speak(utter);
+        return exact || lang || base || null;
       }
 
-      // Safety net: if the last utterance never fires onend (some browsers are
-      // flaky with speechSynthesis), resolve after an estimated timeout based
-      // on total text length (~15 chars/sec worst case).
-      var estMs = Math.max(2000, Math.round(chunks.join(' ').length / 15 * 1000));
-      setTimeout(done, estMs + 3000);
+      function speakNext(idx) {
+        if (!STATE.ttsActive || !PLAYBACK.isCurrent(playbackToken)) { done(); return; }
+        if (idx >= chunks.length) { done(); return; }
+        var utter = new SpeechSynthesisUtterance(chunks[idx]);
+        var voice = pickVoice();
+        if (voice) utter.voice = voice;
+        else if (CFG.ttsVoice) utter.lang = CFG.ttsVoice.split('-').slice(0, 2).join('-');
+        if (CFG.ttsRate) { var r = parseFloat(CFG.ttsRate); if (!isNaN(r) && r > -50) utter.rate = 1 + r / 100; }
+        utter.onend = function () { speakNext(idx + 1); };
+        utter.onerror = function () { speakNext(idx + 1); };
+        // Chrome bug: after cancel() or idle, the synth stays paused — force
+        // resume right before every utterance so speak() actually fires.
+        try { synth.resume(); } catch (_) {}
+        try { synth.speak(utter); } catch (_) { speakNext(idx + 1); }
+      }
+
+      if (voices.length) {
+        speakNext(0);
+        return;
+      }
+      // Voices not loaded yet (Chrome) — wait for voiceschanged, but never hang:
+      // the fallback timer proceeds with the best available default voice.
+      var fallback = setTimeout(function () { speakNext(0); }, 2500);
+      try {
+        synth.addEventListener('voiceschanged', function onVoices() {
+          clearTimeout(fallback);
+          loadVoices();
+          speakNext(0);
+        });
+      } catch (_) {
+        setTimeout(function () { speakNext(0); }, 300);
+      }
     });
   }
 

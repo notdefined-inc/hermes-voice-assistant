@@ -5,7 +5,7 @@
       "name": "Voice Assistant",
       "description": "Live partial STT, sentence-streaming TTS, guarded final STT, steering, and barge-in",
       "enabled": true,
-      "scripts": ["assets/voice-turn-coordinator.js", "assets/streaming-voice-pipeline.js", "assets/live-stt-client.js", "assets/supertonic-engine.js", "assets/voice-assistant.js"],
+      "scripts": ["assets/voice-turn-coordinator.js", "assets/streaming-voice-pipeline.js", "assets/live-stt-client.js", "assets/voice-assistant.js"],
       "stylesheets": ["assets/voice-assistant.css"]
     }
   ]

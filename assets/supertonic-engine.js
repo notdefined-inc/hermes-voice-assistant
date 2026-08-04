@@ -248,10 +248,29 @@
   }
 
   function splitText(text, maxLen) {
-    var paragraphs = String(text || '').trim().split(/\n\s*\n+/).filter(function (p) { return p.trim(); });
+    var str = String(text || '').trim();
+    if (!str) return [];
+    var paragraphs = str.split(/\n\s*\n+/).filter(function (p) { return p.trim(); });
     var chunks = [];
+
+    // Use Intl.Segmenter for robust, Unicode-aware sentence splitting.
+    var seg = (typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function')
+      ? new Intl.Segmenter([], { granularity: 'sentence' })
+      : null;
+
     paragraphs.forEach(function (paragraph) {
-      var sentences = paragraph.trim().split(/(?<=[.!?])\s+/);
+      var sentences;
+      if (seg) {
+        sentences = Array.from(seg.segment(paragraph.trim()))
+          .map(function (s) { return s.segment.trim(); })
+          .filter(Boolean);
+      } else {
+        // Fallback: extended Unicode terminal punctuation
+        sentences = paragraph.trim()
+          .split(/(?<=[.!?\u0964\u0965\u061F\u06D4\u3002\uFF01\uFF1F])\s+/)
+          .filter(Boolean);
+      }
+
       var current = '';
       sentences.forEach(function (sentence) {
         if (current && current.length + sentence.length + 1 > maxLen) {
@@ -263,7 +282,8 @@
       });
       if (current) chunks.push(current.trim());
     });
-    if (!chunks.length && String(text || '').trim()) chunks.push(String(text).trim().slice(0, maxLen));
+
+    if (!chunks.length && str) chunks.push(str.slice(0, maxLen));
     return chunks;
   }
 
