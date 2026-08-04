@@ -1954,14 +1954,24 @@
 
   // Prefetch TTS audio for a sentence. Returns a Promise<array of {url, text}>.
   // Falls back gracefully — if prefetch fails, speakText will re-fetch.
-  // Fetches are serialized via TTS_FETCH_CHAIN to prevent 429 rate limiting.
+  // Fetches are serialized via TTS_FETCH_CHAIN to prevent 429 rate limiting,
+  // and request STARTS are spaced >=2100ms apart to match the server's
+  // per-client 2s window (server.py: _handle_tts limiter). Without the gap,
+  // two fast consecutive TTS calls trip the limiter and every retry adds
+  // latency to the streaming pipeline.
   var TTS_FETCH_CHAIN = Promise.resolve();
+  var TTS_LAST_FETCH_START = 0;
+  var TTS_MIN_START_GAP_MS = 2100;
   function serializedTtsFetch(text, token, streamId) {
     var run = TTS_FETCH_CHAIN.then(function () {
+      // Wait until we are allowed to START a new request (not merely finish
+      // one) — the server limits starts within its window.
+      var now = Date.now();
+      var wait = TTS_LAST_FETCH_START ? Math.max(0, TTS_MIN_START_GAP_MS - (now - TTS_LAST_FETCH_START)) : 0;
+      return new Promise(function (resolve) { setTimeout(function () { resolve(); }, wait); });
+    }).then(function () {
+      TTS_LAST_FETCH_START = Date.now();
       return fetchAudioBlob(text);
-    }).then(function (url) {
-      // Small gap between consecutive TTS requests to avoid 429 rate limiting
-      return new Promise(function (resolve) { setTimeout(function () { resolve(url); }, 200); });
     });
     // Keep the chain alive even if this fetch fails
     TTS_FETCH_CHAIN = run.then(function () {}, function () {});
@@ -2535,7 +2545,7 @@
     hookSSE();
     checkCapabilities();
     testWasmEval();
-    vaDbg('BOOT', 'Voice Assistant v5.0 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
+    vaDbg('BOOT', 'Voice Assistant v5.2 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
       stt: CFG.streamingSttEnabled, tts: CFG.ttsEngine, voice: CFG.ttsVoice,
       crisp: CFG.crispPrompt, truncate: CFG.truncateEnabled, autoListen: CFG.autoListen,
     }));
