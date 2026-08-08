@@ -145,7 +145,7 @@
     streamingSttLanguage: 'en',
 
     ttsEnabled: true,
-    ttsEngine: 'edge',       // edge | openai | elevenlabs | browser | supertonic-server
+    ttsEngine: 'edge',       // edge | openai | elevenlabs | browser | supertonic-server | cloudflare
     ttsRate: '',
     ttsChunkSize: 500,
     // Per-engine voice profiles. ttsVoice is the Edge name (allowlisted by the
@@ -155,6 +155,7 @@
     // creator voice. Library voices (e.g. m3yAHyFEFKtbCIM5n7GF) require a paid plan.
     ttsVoice: 'en-GB-SoniaNeural',
     elevenlabsVoice: 'pNInz6obpgDQGcFmaJgB',
+    cloudflareVoice: 'luna',  // Deepgram Aura-2 speaker (see enum in server)
     openaiVoice: 'alloy',
     supertonicVoice: 'F1',
     supertonicLang: 'na',
@@ -525,6 +526,7 @@
       '<select id="va-engine-select">',
         '<option value="edge"' + (CFG.ttsEngine === 'edge' ? ' selected' : '') + '>Edge (free)</option>',
         '<option value="openai"' + (CFG.ttsEngine === 'openai' ? ' selected' : '') + '>OpenAI</option>',
+        '<option value="cloudflare"' + (CFG.ttsEngine === 'cloudflare' ? ' selected' : '') + '>Cloudflare Aura (free)</option>',
         '<option value="elevenlabs"' + (CFG.ttsEngine === 'elevenlabs' ? ' selected' : '') + '>ElevenLabs</option>',
         '<option value="browser"' + (CFG.ttsEngine === 'browser' ? ' selected' : '') + '>Browser (client)</option>',
         '<option value="supertonic-server"' + (CFG.ttsEngine === 'supertonic-server' ? ' selected' : '') + '>Supertonic 3 (server)</option>',
@@ -598,6 +600,15 @@
       }
       return '<select id="va-voice-select">' + opts2 + '</select>';
     }
+    if (CFG.ttsEngine === 'cloudflare') {
+      // Deepgram Aura-2 speakers hosted on Cloudflare Workers AI.
+      var cfVoices = ['amalthea', 'apollo', 'athena', 'atlas', 'aurora', 'cora', 'helena', 'hera', 'iris', 'juno', 'luna', 'mars', 'ophelia', 'orion', 'phoebe', 'zeus'];
+      var cfOpts = '';
+      for (var cv = 0; cv < cfVoices.length; cv++) {
+        cfOpts += '<option value="' + cfVoices[cv] + '"' + (CFG.cloudflareVoice === cfVoices[cv] ? ' selected' : '') + '>' + cfVoices[cv] + '</option>';
+      }
+      return '<select id="va-voice-select">' + cfOpts + '</select>';
+    }
     if (CFG.ttsEngine === 'browser') {
       return '<input type="text" id="va-voice-input" value="' + (CFG.ttsVoice || '') + '" placeholder="e.g. en-GB, or voice name" style="width:180px;" spellcheck="false">';
     }
@@ -631,6 +642,7 @@
     if (hint) {
       if (CFG.ttsEngine === 'elevenlabs') hint.textContent = 'Paste an ElevenLabs voice_id';
       else if (CFG.ttsEngine === 'openai') hint.textContent = 'Choose an OpenAI voice name';
+      else if (CFG.ttsEngine === 'cloudflare') hint.textContent = 'Deepgram Aura-2 speaker (free tier ~3.6k chars/day)';
       else if (CFG.ttsEngine === 'browser') hint.textContent = 'Lang tag (e.g. en-GB) or OS voice name';
       else if (CFG.ttsEngine === 'supertonic-server') hint.textContent = 'Server-side Supertonic voice style (M1–M5 / F1–F5)';
       else hint.textContent = 'Choose an Edge (Microsoft) neural voice';
@@ -664,6 +676,9 @@
           }
         } else if (CFG.ttsEngine === 'supertonic-server') {
           CFG.supertonicVoice = sel.value;
+          saveSettings();
+        } else if (CFG.ttsEngine === 'cloudflare') {
+          CFG.cloudflareVoice = sel.value;
           saveSettings();
         }
       });
@@ -2194,6 +2209,7 @@
     var voice = CFG.ttsVoice;
     if (CFG.ttsEngine === 'openai') voice = CFG.openaiVoice;
     else if (CFG.ttsEngine === 'elevenlabs') voice = CFG.elevenlabsVoice;
+    else if (CFG.ttsEngine === 'cloudflare') voice = CFG.cloudflareVoice;
     else if (CFG.ttsEngine === 'supertonic-server') {
       voice = CFG.supertonicVoice;
       body.lang = CFG.supertonicLang;
@@ -2558,7 +2574,7 @@
     hookSSE();
     checkCapabilities();
     testWasmEval();
-    vaDbg('BOOT', 'Voice Assistant v5.2.1 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
+    vaDbg('BOOT', 'Voice Assistant v5.2.2 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
       stt: CFG.streamingSttEnabled, tts: CFG.ttsEngine, voice: CFG.ttsVoice,
       crisp: CFG.crispPrompt, truncate: CFG.truncateEnabled, autoListen: CFG.autoListen,
     }));
