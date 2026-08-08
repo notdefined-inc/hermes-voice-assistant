@@ -171,6 +171,7 @@
     //   xai        — xAI Grok STT API
     //   elevenlabs — ElevenLabs Scribe API
     //   deepinfra  — DeepInfra Whisper API
+    //   cloudflare — Cloudflare Workers AI Whisper (free tier ~214 min/day)
     // Engine availability is checked server-side; a missing API key returns a
     // clear 503 "not configured" error instead of silently falling back.
     sttProvider: 'auto',
@@ -504,6 +505,7 @@
         '<option value="xai"' + (CFG.sttProvider === 'xai' ? ' selected' : '') + '>xAI</option>',
         '<option value="elevenlabs"' + (CFG.sttProvider === 'elevenlabs' ? ' selected' : '') + '>ElevenLabs</option>',
         '<option value="deepinfra"' + (CFG.sttProvider === 'deepinfra' ? ' selected' : '') + '>DeepInfra</option>',
+        '<option value="cloudflare"' + (CFG.sttProvider === 'cloudflare' ? ' selected' : '') + '>Cloudflare (free tier)</option>',
       '</select></div>',
       '<div class="va-setting-row"><div><label>STT Language</label><div class="va-hint">Language for transcription</div></div>',
       '<select id="va-stt-lang-select">',
@@ -757,7 +759,8 @@
     });
 
     // STT Provider selector — batch transcription backend (auto / local / groq /
-    // openai / mistral / xai / elevenlabs / deepinfra). The choice is forwarded
+    // openai / mistral / xai / elevenlabs / deepinfra / cloudflare). The choice
+    // is forwarded
     // to /api/transcribe, which resolves availability server-side.
     var sttProvider = document.getElementById('va-stt-provider-select');
     if (sttProvider) sttProvider.addEventListener('change', function () {
@@ -767,6 +770,7 @@
         if (CFG.sttProvider === 'auto') hint.textContent = 'Server picks: config stt.provider, else local > cloud';
         else if (CFG.sttProvider === 'local') hint.textContent = 'faster-whisper on this machine — free, offline';
         else if (CFG.sttProvider === 'elevenlabs') hint.textContent = 'Live mode → Realtime WebSocket · batch → Scribe';
+        else if (CFG.sttProvider === 'cloudflare') hint.textContent = 'Workers AI Whisper — free tier ~214 min/day';
         else hint.textContent = 'Requires the matching API key on the server';
       }
       saveSettings();
@@ -2554,7 +2558,7 @@
     hookSSE();
     checkCapabilities();
     testWasmEval();
-    vaDbg('BOOT', 'Voice Assistant v5.2 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
+    vaDbg('BOOT', 'Voice Assistant v5.2.1 loaded — live STT + streaming TTS + barge-in | cfg=' + JSON.stringify({
       stt: CFG.streamingSttEnabled, tts: CFG.ttsEngine, voice: CFG.ttsVoice,
       crisp: CFG.crispPrompt, truncate: CFG.truncateEnabled, autoListen: CFG.autoListen,
     }));

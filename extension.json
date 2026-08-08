@@ -1,7 +1,7 @@
 {
   "id": "voice-assistant",
   "name": "Voice Assistant",
-  "version": "5.2.0",
+  "version": "5.2.1",
   "description": "Live partial STT, sentence-streaming TTS, guarded final STT, steering, and barge-in",
   "assets": {
     "scripts": [
